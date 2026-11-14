@@ -1,0 +1,213 @@
+// unit_tests.nv — the motions, the objects, the operators and the other
+// parts a program may call without the whole key loop, each named once.
+
+use std.test
+use vimtext
+use vimmodal
+use vimmotion
+use vimobject
+use vimedit
+use viminsert
+use vimnormal
+use vimscroll
+use vimram
+
+fn prose() -> Doc
+    vimram.doc_new(["hello world foo", "  bar.baz(qux) end", "", "last line here"], 22)
+
+fn at(l: Int, c: Int) -> Pos
+    vimtext.pos_new(l, c)
+
+@test
+fn test_a_motion_result_says_where_and_how() [io]
+    let a = vimmotion.mv_at(1, 2)
+    test.assert(a.ok and not a.inclusive and not a.linewise)
+    let b = vimmotion.mv_incl(1, 2)
+    test.assert(b.ok and b.inclusive)
+    let c = vimmotion.mv_lines(3, 0, vimmotion.WANT_KEEP)
+    test.assert(c.ok and c.linewise)
+    test.assert_eq(c.want, vimmotion.WANT_KEEP)
+    let f = vimmotion.mv_fail(4, 5)
+    test.assert(f.ok == false)
+    test.assert_eq(f.line, 4)
+
+@test
+fn test_one_step_over_characters() [io]
+    let d = prose()
+    test.assert_eq(vimmotion.inc_pos(d, 0, 3).col, 4)
+    test.assert_eq(vimmotion.inc_pos(d, 0, 15).r, 1)
+    test.assert_eq(vimmotion.inc_pos(d, 0, 14).r, 2)
+    test.assert_eq(vimmotion.inc_pos(d, 0, 13).r, 0)
+    test.assert_eq(vimmotion.inc_pos(d, 3, 14).r, 0 - 1)
+    test.assert_eq(vimmotion.dec_pos(d, 0, 3).col, 2)
+    test.assert_eq(vimmotion.dec_pos(d, 1, 0).line, 0)
+    test.assert_eq(vimmotion.dec_pos(d, 0, 0).r, 0 - 1)
+
+@test
+fn test_the_word_algorithms() [io]
+    let d = prose()
+    test.assert_eq(vimmotion.fwd_word(d, at(0, 0), 1, false, false).col, 6)
+    test.assert_eq(vimmotion.bck_word(d, at(0, 8), 1, false, false).col, 6)
+    test.assert_eq(vimmotion.end_word(d, at(0, 0), 1, false, false, false).col, 4)
+    test.assert_eq(vimmotion.bckend_word(d, at(0, 8), 1, false, false).col, 4)
+
+@test
+fn test_the_word_motions() [io]
+    let d = prose()
+    test.assert_eq(vimmotion.motion_w(d, at(0, 0), 1, false, false, false, false).col, 6)
+    test.assert_eq(vimmotion.motion_w(d, at(0, 0), 1, false, true, true, false).col, 4)
+    test.assert_eq(vimmotion.motion_e(d, at(0, 0), 1, false, false, false).col, 4)
+    test.assert_eq(vimmotion.motion_b(d, at(0, 8), 1, false).col, 6)
+    test.assert_eq(vimmotion.motion_ge(d, at(0, 8), 1, false).col, 4)
+
+@test
+fn test_the_moves_within_and_between_lines() [io]
+    let d = prose()
+    test.assert_eq(vimmotion.motion_h(at(0, 3), 2, false).col, 1)
+    test.assert(vimmotion.motion_h(at(0, 0), 1, false).ok == false)
+    test.assert_eq(vimmotion.motion_l(d, at(0, 3), 2, false, false).col, 5)
+    test.assert_eq(vimmotion.motion_l(d, at(0, 14), 1, true, false).col, 15)
+    test.assert_eq(vimmotion.motion_l(d, at(0, 14), 1, false, true).col, 15)
+    test.assert_eq(vimmotion.motion_j(d, at(0, 5), 1, 5).line, 1)
+    test.assert_eq(vimmotion.motion_j(d, at(0, 5), 0 - 1, 5).ok, false)
+    test.assert_eq(vimmotion.motion_first_nonblank_down(d, at(0, 0), 1).col, 2)
+    test.assert_eq(vimmotion.motion_underscore(d, at(0, 0), 2).line, 1)
+    test.assert_eq(vimmotion.motion_zero(at(1, 5)).col, 0)
+    test.assert_eq(vimmotion.motion_caret(d, at(1, 5)).col, 2)
+    test.assert_eq(vimmotion.motion_dollar(d, at(0, 0), 1).col, 14)
+    test.assert_eq(vimmotion.motion_g_underscore(d, at(1, 0), 1).col, 17)
+    test.assert_eq(vimmotion.motion_bar(d, at(0, 0), 5).col, 4)
+    test.assert_eq(vimmotion.motion_gg(d, false, 0, true).line, 3)
+    test.assert_eq(vimmotion.motion_gg(d, true, 2, false).line, 1)
+
+@test
+fn test_finding_a_character_in_the_line() [io]
+    let d = prose()
+    test.assert_eq(vimmotion.motion_find(d, at(0, 0), vimmotion.FIND_F, 'o', 1, false).col, 4)
+    test.assert_eq(vimmotion.motion_find(d, at(0, 0), vimmotion.FIND_T, 'o', 1, false).col, 3)
+    test.assert_eq(vimmotion.motion_find(d, at(0, 10), vimmotion.FIND_BACK_F, 'o', 1, false).col, 7)
+    test.assert_eq(vimmotion.motion_find(d, at(0, 10), vimmotion.FIND_BACK_T, 'o', 1, false).col, 8)
+    test.assert(vimmotion.find_forward(vimmotion.FIND_T))
+    test.assert(vimmotion.find_forward(vimmotion.FIND_BACK_F) == false)
+    test.assert(vimmotion.find_till(vimmotion.FIND_BACK_T))
+    test.assert(vimmotion.find_till(vimmotion.FIND_F) == false)
+
+@test
+fn test_matching_brackets_and_paragraphs() [io]
+    let d = prose()
+    let m = vimmotion.match_pair(d, 1, 9, '(', ')', true)
+    test.assert_eq(m.col, 13)
+    test.assert_eq(vimmotion.motion_percent(d, at(1, 9)).col, 13)
+    test.assert_eq(vimmotion.motion_percent_count(d, at(0, 0), 50).line, 1)
+    test.assert_eq(vimmotion.motion_paragraph(d, at(0, 0), 1, true).line, 2)
+    test.assert_eq(vimmotion.motion_paragraph(d, at(3, 0), 1, false).line, 2)
+
+@test
+fn test_sentences() [io]
+    let d = vimram.doc_new(["One. Two three.  Four?"], 5)
+    test.assert_eq(vimmotion.motion_sentence(d, at(0, 0), 1, true).col, 5)
+    test.assert_eq(vimmotion.find_sentence(d, at(0, 5), 1, true).col, 17)
+    test.assert_eq(vimmotion.motion_sentence(d, at(0, 8), 1, false).col, 5)
+    test.assert_eq(vimmotion.find_first_blank(d, at(0, 5)).col, 4)
+    let o = vimmotion.obj_sentence(d, at(0, 8), 1, false)
+    test.assert_eq(o.sc, 5)
+    test.assert_eq(o.ec, 15)
+
+@test
+fn test_the_motions_over_the_window() [io]
+    var d = vimram.doc_new(["a", "b", "c", "d", "e", "f"], 4)
+    d.top = 1
+    test.assert_eq(vimmotion.motion_window(d, 'H', 1).line, 1)
+    test.assert_eq(vimmotion.motion_window(d, 'M', 1).line, 2)
+    test.assert_eq(vimmotion.motion_window(d, 'L', 1).line, 4)
+
+@test
+fn test_text_objects() [io]
+    let d = prose()
+    test.assert(vimobject.obj_fail().ok == false)
+    let w = vimobject.obj_word(d, at(0, 2), at(0, 2), false, 1, false, false)
+    test.assert_eq(w.sc, 0)
+    test.assert_eq(w.ec, 4)
+    let p = vimobject.obj_paragraph(d, at(0, 0), at(0, 0), false, false, 1, false)
+    test.assert_eq(p.el, 1)
+    test.assert(p.linewise)
+    let b = vimobject.obj_block(d, at(1, 10), at(1, 10), false, 1, false, '(', ')')
+    test.assert_eq(b.sc, 10)
+    test.assert_eq(b.ec, 12)
+    let q = vimram.doc_new(["say \"hi there\" now"], 5)
+    let s = vimobject.obj_quote(q, at(0, 6), 1, false, '"')
+    test.assert_eq(s.sc, 5)
+    test.assert_eq(s.ec, 13)
+
+@test
+fn test_ranges_and_the_operators_on_them() [io]
+    var d = prose()
+    var m = vimmodal.modal_new()
+    let lines = vimedit.rgn_lines(1, 4, 2)
+    test.assert(lines.linewise)
+    let r = vimedit.make_rgn(d, vimmodal.OP_DELETE, at(0, 0), at(0, 6), false, false)
+    test.assert_eq(r.ec, 6)
+    let v = vimedit.visual_rgn(d, vimmodal.MODE_VISUAL, at(0, 2), at(0, 4))
+    test.assert_eq(v.ec, 5)
+    vimedit.run_op(var m, d, vimmodal.OP_YANK, r, false, 1)
+    test.assert_eq(m.reg_text('0'), "hello ")
+    test.assert(vimedit.put_register(var m, d, false, 1, '0'))
+    var j = vimmodal.modal_new()
+    test.assert(vimedit.join_lines(var j, d, 2, true))
+    var x = vimmodal.modal_new()
+    test.assert(vimedit.replace_chars(var x, d, 'x', 1))
+    var t = vimmodal.modal_new()
+    test.assert(vimedit.toggle_chars(var t, d, 2))
+    var o = vimmodal.modal_new()
+    vimedit.open_line(var o, d, true, 1)
+    test.assert_eq(o.mode, vimmodal.MODE_INSERT)
+
+@test
+fn test_the_text_typed_in_insert_mode() [io]
+    let d = prose()
+    var m = vimmodal.modal_new()
+    viminsert.insert_start(var m, d, vimmodal.MODE_INSERT, 1, 0)
+    viminsert.insert_key(var m, d, 'x')
+    test.assert_eq(m.ins_text, ['x'])
+    viminsert.insert_finish(var m, d)
+    test.assert_eq(m.mode, vimmodal.MODE_NORMAL)
+    test.assert_eq(m.dot_text, ['x'])
+
+@test
+fn test_the_key_loop_by_the_parts() [io]
+    let d = prose()
+    var m = vimmodal.modal_new()
+    vimnormal.normal_key(var m, d, 'j')
+    test.assert_eq(m.line, 1)
+    vimnormal.handle_key(var m, d, 'k')
+    test.assert_eq(m.line, 0)
+    test.case("a search answered")
+    vimnormal.handle_key(var m, d, '/')
+    test.assert_eq(m.mode, vimmodal.MODE_CMDLINE)
+    vimnormal.cmdline_finish(var m, d, "foo")
+    test.assert(m.search_wait)
+    vimnormal.search_done(var m, d, true, 0, 12)
+    test.assert_eq(m.col, 12)
+    test.case("a command line left")
+    vimnormal.handle_key(var m, d, ':')
+    vimnormal.cmdline_cancel(var m)
+    test.assert_eq(m.mode, vimmodal.MODE_NORMAL)
+
+@test
+fn test_the_scroll_keys_by_the_parts() [io]
+    var d = vimram.doc_new(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"], 4)
+    var m = vimmodal.modal_new()
+    vimscroll.scroll_lines(var m, d, 2)
+    test.assert_eq(m.line, 2)
+    vimscroll.scroll_half(var m, d, true, 0)
+    test.assert_eq(m.line, 4)
+    vimscroll.scroll_page(var m, d, true, 1)
+    test.assert_eq(m.line, 2)
+    vimscroll.scroll_cursor_line(var m, d, 1)
+    test.assert_eq(m.line, 2)
+
+@test
+fn test_one_place_before_another() [io]
+    test.assert(vimtext.pos_before(vimtext.pos_new(0, 5), vimtext.pos_new(1, 0)))
+    test.assert(vimtext.pos_before(vimtext.pos_new(1, 0), vimtext.pos_new(0, 5)) == false)
+    test.assert(vimtext.pos_before(vimtext.pos_new(1, 1), vimtext.pos_new(1, 1)) == false)

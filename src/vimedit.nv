@@ -1,0 +1,312 @@
+// vimedit.nv — what the operators and the single-key edits do to a range
+// of text.
+//
+// An operator takes a range.  A range is made from where the cursor was and
+// where a motion or a text object took it, by the rules Vim's `ops.c` gives:
+// an exclusive motion that ends in column zero stops at the end of the line
+// before, and `d` over several lines that leave only blanks on both ends
+// takes whole lines.  The operator then writes the registers, emits the
+// actions, and leaves the cursor where Vim does.
+//
+// The cursor a range leaves can depend on text that is not yet changed, such
+// as the first non-blank character of a line that was just shifted.  The
+// package sets `nonblank` for those and `settle` in `vimstep` reads the text
+// again to find the column.
+
+use std.list
+use std.str
+use vimtext
+use vimmodal
+use viminsert
+
+// Rgn is a range an operator works on.  A characterwise range runs from
+// (`sl`, `sc`) up to but not including (`el`, `ec`).  A linewise range is
+// the lines `sl` to `el`, and `sc` is the column of the cursor at its start.
+// `empty` is a characterwise range with nothing in it.
+pub @value
+struct Rgn
+    sl: Int
+    sc: Int
+    el: Int
+    ec: Int
+    linewise: Bool
+    empty: Bool
+
+// rgn_lines is a linewise range.
+pub fn rgn_lines(sl: Int, sc: Int, el: Int) -> Rgn
+    Rgn { sl: sl, sc: sc, el: el, ec: 0, linewise: true, empty: false }
+
+// make_rgn builds the range between the cursor `a` and the place `b` a
+// motion reached.  `inclusive` says whether the character at the later of
+// the two is part of the range.
+pub fn make_rgn<V: TextView>(view: V, op: Int, a0: Pos, b0: Pos, linewise: Bool,
+                             inclusive: Bool) -> Rgn
+    var a = a0
+    var b = b0
+    if vimtext.pos_before(b0, a0)
+        a = b0
+        b = a0
+    if linewise
+        return rgn_lines(a.line, a.col, b.line)
+    var el = b.line
+    var ec = b.col
+    var incl = inclusive
+    if not incl and ec == 0 and el > a.line
+        el = el - 1
+        if a.col <= view.first_nonblank_raw(a.line)
+            return rgn_lines(a.line, a.col, el)
+        ec = view.len_at(el)
+        if ec > 0
+            ec = ec - 1
+            incl = true
+    if op == OP_DELETE and el > a.line
+        var idx = ec
+        if idx < view.len_at(el) and incl
+            idx = idx + 1
+        let n = view.len_at(el)
+        while idx < n and vimtext.is_blank(view.char_at(el, idx))
+            idx = idx + 1
+        if idx >= n and a.col <= view.first_nonblank_raw(a.line)
+            return rgn_lines(a.line, a.col, el)
+    var xc = ec
+    if incl
+        xc = ec + 1
+    let n2 = view.len_at(el)
+    if xc > n2
+        xc = n2
+    Rgn { sl: a.line, sc: a.col, el: el, ec: xc, linewise: false,
+          empty: el == a.line and xc <= a.col and not incl }
+
+// visual_rgn is the range a Visual selection covers.  A selection that ends
+// on the end of a line includes the line break.
+pub fn visual_rgn<V: TextView>(view: V, mode: Int, a0: Pos, b0: Pos) -> Rgn
+    var a = a0
+    var b = b0
+    if vimtext.pos_before(b0, a0)
+        a = b0
+        b = a0
+    if mode == MODE_VISUAL_LINE
+        return rgn_lines(a.line, 0, b.line)
+    var el = b.line
+    var ec = b.col + 1
+    if b.col >= view.len_at(b.line)
+        if b.line < view.last_line()
+            el = b.line + 1
+            ec = 0
+        else
+            ec = view.len_at(b.line)
+    Rgn { sl: a.line, sc: a.col, el: el, ec: ec, linewise: false,
+          empty: el == a.line and ec <= a.col }
+
+// rgn_text is the text a range covers.
+fn rgn_text<V: TextView>(view: V, r: Rgn) -> Str
+    if r.linewise
+        view.lines_text(r.sl, r.el)
+    else
+        view.text_between(vimtext.pos_new(r.sl, r.sc), vimtext.pos_new(r.el, r.ec))
+
+// rgn_span is the span of a range.
+fn rgn_span(r: Rgn) -> Span
+    if r.linewise
+        Span.lines(r.sl, r.el)
+    else
+        Span.chars(r.sl, r.sc, r.el, r.ec)
+
+// case_kind is the case change an operator makes.
+fn case_kind(op: Int) -> Int
+    if op == OP_LOWER
+        CASE_LOWER
+    else if op == OP_UPPER
+        CASE_UPPER
+    else
+        CASE_TOGGLE
+
+// run_op applies an operator to a range.  `big` makes a delete go to `"1`
+// whatever its size.  `levels` is the number of shifts for `>` and `<`.
+pub fn run_op<V: TextView>(var m: Modal, view: V, op: Int, r: Rgn, big: Bool, levels: Int)
+    if op == OP_DELETE
+        if r.linewise
+            m.reg_write_delete(rgn_text(view, r), true, big)
+            m.begin_change()
+            m.emit(Delete(span: Span.lines(r.sl, r.el)))
+            m.marks_remove_lines(r.sl, r.el)
+            let remaining = view.line_count() - (r.el - r.sl + 1)
+            var nl = r.sl
+            if nl > remaining - 1
+                nl = remaining - 1
+            if nl < 0
+                nl = 0
+            m.place(nl, 0)
+            m.nonblank = true
+        else if not r.empty and (r.el > r.sl or r.ec > r.sc)
+            m.reg_write_delete(rgn_text(view, r), false, big)
+            m.begin_change()
+            m.emit(Delete(span: Span.chars(r.sl, r.sc, r.el, r.ec)))
+            m.place(r.sl, r.sc)
+        else
+            m.place(r.sl, r.sc)
+    else if op == OP_CHANGE
+        m.begin_change()
+        if r.linewise
+            m.reg_write_delete(rgn_text(view, r), true, big)
+            let n = view.len_at(r.el)
+            if r.el > r.sl or n > 0
+                m.emit(Delete(span: Span.chars(r.sl, 0, r.el, n)))
+            if r.el > r.sl
+                m.marks_remove_lines(r.sl + 1, r.el)
+            m.place(r.sl, 0)
+        else
+            if not r.empty
+                m.reg_write_delete(rgn_text(view, r), false, big)
+                m.emit(Delete(span: Span.chars(r.sl, r.sc, r.el, r.ec)))
+            m.place(r.sl, r.sc)
+        viminsert.insert_start(var m, view, MODE_INSERT, 1, 0)
+    else if op == OP_YANK
+        if not r.empty
+            m.reg_write_yank(rgn_text(view, r), r.linewise)
+            m.emit(Yank(span: rgn_span(r)))
+        m.place(r.sl, r.sc)
+    else if op == OP_SHIFT_RIGHT or op == OP_SHIFT_LEFT
+        m.begin_change()
+        if op == OP_SHIFT_RIGHT
+            m.emit(Indent(first: r.sl, last: r.el, levels: levels))
+        else
+            m.emit(Dedent(first: r.sl, last: r.el, levels: levels))
+        m.place(r.sl, 0)
+        m.nonblank = true
+    else
+        if not r.empty
+            m.begin_change()
+            m.emit(ChangeCase(span: rgn_span(r), kind: case_kind(op)))
+        m.place(r.sl, r.sc)
+
+// put_register is `p` and `P`: it puts the text of a register `count` times,
+// where `count` is at least one.  It answers false when the register is empty.
+pub fn put_register<V: TextView>(var m: Modal, view: V, before: Bool, count: Int, name: Int) -> Bool
+    let slot = m.reg_slot(name)
+    if slot < 0 or not m.regs_set[slot]
+        return false
+    let text = m.regs[slot]
+    let lw = m.regs_linewise[slot]
+    let n = count
+    var rep = ""
+    var i = 0
+    while i < n
+        if lw and i > 0
+            rep = rep + "\n"
+        rep = rep + text
+        i = i + 1
+    m.begin_change()
+    if lw
+        let at = if before
+            m.line
+        else
+            m.line + 1
+        m.emit(Put(line: at, col: 0, text: rep, linewise: true))
+        m.marks_add_lines(at, str.count(rep, "\n") + 1)
+        m.place(at, 0)
+        m.nonblank = true
+    else
+        let len = view.len_at(m.line)
+        let col = if before
+            m.col
+        else
+            if len > 0
+                m.col + 1
+            else
+                0
+        m.emit(Put(line: m.line, col: col, text: rep, linewise: false))
+        let cps = vimtext.decode_utf8(rep)
+        if list.contains(cps, '\n')
+            m.place(m.line, col)
+        else
+            m.place(m.line, col + list.len(cps) - 1)
+    true
+
+// join_lines is `J` and `gJ` over `count` lines from the cursor.  It
+// answers false when there is nothing below to join.
+pub fn join_lines<V: TextView>(var m: Modal, view: V, count_in: Int, spaces: Bool) -> Bool
+    var count = count_in
+    if count < 2
+        count = 2
+    let last = view.last_line()
+    if m.line + count - 1 > last
+        if count <= 2
+            return false
+        count = last - m.line + 1
+        if count == 1
+            m.place(m.line, 0)
+            return true
+    var total = view.len_at(m.line)
+    var col = total
+    var prev_last = view.ch(m.line, total - 1)
+    if prev_last < 0
+        prev_last = 0
+    var k = 1
+    while k < count
+        let l = m.line + k
+        let n = view.len_at(l)
+        var from = 0
+        if spaces
+            from = view.first_nonblank_raw(l)
+        let piece = n - from
+        var sp = 0
+        if spaces and piece > 0 and total > 0 and view.char_at(l, from) != ')' and prev_last != '\t' and prev_last != ' '
+            sp = 1
+        col = total
+        total = total + sp + piece
+        prev_last = if piece > 0
+            view.char_at(l, n - 1)
+        else
+            0
+        k = k + 1
+    m.begin_change()
+    m.emit(JoinLines(line: m.line, count: count, spaces: spaces))
+    m.place(m.line, col)
+    true
+
+// replace_chars is `r{char}` over `count` characters.  It answers false
+// when the line has fewer characters than that to the right of the cursor.
+pub fn replace_chars<V: TextView>(var m: Modal, view: V, c: Int, count: Int) -> Bool
+    let n = view.len_at(m.line)
+    if n == 0 or m.col + count > n
+        return false
+    m.begin_change()
+    if c == K_ENTER_CODE
+        m.emit(Delete(span: Span.chars(m.line, m.col, m.line, m.col + count)))
+        m.emit(Insert(line: m.line, col: m.col, text: "\n"))
+        m.place(m.line + 1, 0)
+    else
+        m.emit(ReplaceChar(line: m.line, col: m.col, count: count, ch: c))
+        m.place(m.line, m.col + count - 1)
+    true
+
+// The code of Enter, which `r` turns into a line break.
+const K_ENTER_CODE = 13
+
+// toggle_chars is `~` over `count` characters: it toggles their case and
+// moves the cursor past them.
+pub fn toggle_chars<V: TextView>(var m: Modal, view: V, count: Int) -> Bool
+    let n = view.len_at(m.line)
+    if n == 0
+        return false
+    var k = count
+    if m.col + k > n
+        k = n - m.col
+    m.begin_change()
+    m.emit(ChangeCase(span: Span.chars(m.line, m.col, m.line, m.col + k), kind: CASE_TOGGLE))
+    m.place(m.line, m.col + k)
+    true
+
+// open_line is `o` and `O`: it opens a line and enters Insert mode on it.
+pub fn open_line<V: TextView>(var m: Modal, view: V, below: Bool, count: Int)
+    m.begin_change()
+    if below
+        m.emit(Insert(line: m.line, col: view.len_at(m.line), text: "\n"))
+        m.marks_add_lines(m.line + 1, 1)
+        m.place(m.line + 1, 0)
+    else
+        m.emit(Insert(line: m.line, col: 0, text: "\n"))
+        m.marks_add_lines(m.line, 1)
+        m.place(m.line, 0)
+    viminsert.insert_start(var m, view, MODE_INSERT, count, '\n')

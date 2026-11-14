@@ -1,0 +1,95 @@
+// property_tests.nv — after any key the cursor is inside the text.
+//
+// The keys come from a generator with a fixed seed, so a failure repeats.
+// The alphabet is every printable ASCII character, the control keys and the
+// named keys, and the texts have empty lines, blanks, long and short lines
+// and characters outside ASCII.  A command line the editor asks for is
+// answered at once, by abandoning it or by finishing it with a pattern.
+
+use std.test
+use std.list
+use vimmodal
+use vimkey
+use vimstep
+use vimram
+
+fn next(var seed: Int) -> Int
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    seed / 65536
+
+fn alphabet() -> [Int]
+    var out: [Int] = []
+    var c = 32
+    while c < 127
+        list.push(out, c)
+        c = c + 1
+    c = 1
+    while c < 27
+        list.push(out, c)
+        c = c + 1
+    for k in [vimkey.K_ESC, vimkey.K_ENTER, vimkey.K_TAB, vimkey.K_BS, vimkey.K_UP, vimkey.K_DOWN, vimkey.K_LEFT,
+              vimkey.K_RIGHT, vimkey.K_HOME, vimkey.K_END, vimkey.K_DELETE, vimkey.K_PAGE_UP, 0xe9, 0x4e2d]
+        list.push(out, k)
+    out
+
+fn texts() -> [[Str]]
+    [["hello world foo", "  bar.baz(qux) end", "", "last line here"],
+     ["x"],
+     [""],
+     ["a", "", "b", "   ", "c d. e? f! (g) [h] {i} \"j\" 'k'"],
+     ["h\u{e9}llo w\u{f6}rld", "\u{65e5}\u{672c}\u{8a9e} text", "\ttab\tindent"],
+     ["one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve"]]
+
+fn inside(d: Doc, m: Modal) -> Bool
+    if m.line < 0 or m.line >= d.line_count()
+        return false
+    let n = d.len_at(m.line)
+    if m.mode == vimmodal.MODE_INSERT or m.mode == vimmodal.MODE_REPLACE or m.mode == vimmodal.MODE_VISUAL
+        return m.col >= 0 and m.col <= n
+    m.col >= 0 and (m.col < n or m.col == 0 and n == 0)
+
+fn answer_command_line(var d: Doc, m: Modal, pick: Int) -> Modal
+    if m.mode != vimmodal.MODE_CMDLINE
+        return m
+    if pick % 2 == 0
+        return vimstep.cmdline_abort(m).modal
+    let s = vimstep.cmdline_done(m, d, "e")
+    vimram.apply_actions(var d, s.modal, s.actions)
+
+@test
+fn test_the_cursor_is_inside_the_text_after_any_key() [io]
+    let keys = alphabet()
+    var seed = 20260101
+    var t = 0
+    var steps = 0
+    for text in texts()
+        var run = 0
+        while run < 150
+            var d = vimram.doc_new(text, 5)
+            var m = vimmodal.modal_new()
+            var i = 0
+            while i < 40
+                let code = keys[next(var seed) % list.len(keys)]
+                let s = vimstep.step_code(m, d, code)
+                m = vimram.apply_actions(var d, s.modal, s.actions)
+                m = answer_command_line(var d, m, next(var seed))
+                m = vimstep.settle(m, d)
+                test.case("text ${t} run ${run} key ${i} code ${code}")
+                test.assert(d.line_count() >= 1)
+                test.assert(inside(d, m))
+                i = i + 1
+                steps = steps + 1
+            run = run + 1
+        t = t + 1
+    test.assert_eq(steps, 36000)

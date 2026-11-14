@@ -1,0 +1,161 @@
+// vimscroll.nv — the keys that move the window over the text.
+//
+// The window is the host's.  A scroll key asks it to move by an action, and
+// the cursor moves with the text the way Vim keeps it inside the window: a
+// line on screen stays on screen, and a cursor that would fall off an edge
+// is put on the nearest line that is shown.  The window is `height` lines
+// from `top_line`, and the text is taken to be lines that do not wrap.
+
+use vimtext
+use vimmodal
+
+// clamp_top is the first line of a window moved to `top`: not before the
+// first line and not after the last.
+fn clamp_top<V: TextView>(view: V, top: Int) -> Int
+    var t = top
+    if t > view.last_line()
+        t = view.last_line()
+    if t < 0
+        t = 0
+    t
+
+// cursor_col is the column the cursor takes on another line, from the wanted
+// column.
+fn cursor_col<V: TextView>(view: V, line: Int, want: Int) -> Int
+    let n = view.len_at(line)
+    let w = if want == WANT_END
+        n - 1
+    else
+        want
+    var c = w
+    if c > n - 1
+        c = n - 1
+    if c < 0
+        c = 0
+    c
+
+// move_to puts the cursor on a line, with the column its wanted column gives.
+fn move_to<V: TextView>(var m: Modal, view: V, line: Int)
+    if line != m.line
+        m.line = line
+        m.col = cursor_col(view, line, m.want)
+        m.emit(MoveCursor(line: m.line, col: m.col))
+
+// scroll_lines is `Ctrl-E` and `Ctrl-Y`: the window moves `delta` lines, and
+// the cursor stays where it is unless that line leaves the window.
+pub fn scroll_lines<V: TextView>(var m: Modal, view: V, delta: Int)
+    let top = view.top_line()
+    let t = clamp_top(view, top + delta)
+    if t != top
+        m.emit(ScrollBy(lines: t - top))
+    let bottom = t + view.height() - 1
+    if m.line < t
+        move_to(var m, view, t)
+    else if m.line > bottom
+        move_to(var m, view, bottom)
+
+// scroll_half is `Ctrl-D` and `Ctrl-U`: the window and the cursor both move
+// `count` lines, or half the window when there is no count.  The cursor
+// stops at the last line, and at the first.
+pub fn scroll_half<V: TextView>(var m: Modal, view: V, down: Bool, count: Int)
+    var n = count
+    if n < 1
+        n = view.height() / 2
+    if n < 1
+        n = 1
+    let top = view.top_line()
+    if down
+        if m.line >= view.last_line()
+            m.emit(Bell)
+            return
+        var t = top + n
+        var max_top = view.line_count() - view.height()
+        if max_top < top
+            max_top = top
+        if t > max_top
+            t = max_top
+        if t != top
+            m.emit(ScrollBy(lines: t - top))
+        var l = m.line + n
+        if l > view.last_line()
+            l = view.last_line()
+        move_to(var m, view, l)
+        m.nonblank = true
+    else
+        if m.line <= 0
+            m.emit(Bell)
+            return
+        var t = top - n
+        if t < 0
+            t = 0
+        if t != top
+            m.emit(ScrollBy(lines: t - top))
+        var l = m.line - n
+        if l < 0
+            l = 0
+        move_to(var m, view, l)
+        m.nonblank = true
+
+// scroll_page is `Ctrl-F` and `Ctrl-B`: the window moves a page, less two
+// lines that stay in view.
+pub fn scroll_page<V: TextView>(var m: Modal, view: V, down: Bool, count: Int)
+    let pages = if count < 1
+        1
+    else
+        count
+    let h = view.height()
+    let top = view.top_line()
+    if down and top >= view.last_line() or not down and top <= 0
+        m.emit(Bell)
+        return
+    let t = page_top(top, h, view.line_count(), down, pages)
+    if down
+        m.emit(ScrollPage(direction: SCROLL_PAGE_DOWN, pages: pages))
+        move_to(var m, view, t)
+    else
+        m.emit(ScrollPage(direction: SCROLL_PAGE_UP, pages: pages))
+        var l = t + h - 1
+        if l > view.last_line()
+            l = view.last_line()
+        move_to(var m, view, l)
+    m.nonblank = true
+
+// page_top is the first line shown after a page scroll of `pages` pages, for
+// a window `height` lines high over `total` lines that now shows `top`.  A
+// page is the height less two lines, which stay in view.  A host applies
+// `ScrollPage` with this function.
+pub fn page_top(top: Int, height: Int, total: Int, down: Bool, pages: Int) -> Int
+    let last = if total < 1
+        0
+    else
+        total - 1
+    var step = height - 2
+    if step < 1
+        step = 1
+    if top >= last
+        step = height
+    step = step * pages
+    if down
+        if top + step > last or top + height >= total
+            last
+        else
+            top + step
+    else if top - step < 0
+        0
+    else
+        top - step
+
+// scroll_cursor_line is `zt`, `zz` and `zb`: the window moves so that the
+// cursor line is at the top, the middle or the bottom.  `where` is 0, 1 or 2.
+pub fn scroll_cursor_line<V: TextView>(var m: Modal, view: V, where: Int)
+    let top = view.top_line()
+    let h = view.height()
+    var t = m.line
+    if where == 1
+        t = m.line - (h - 1) / 2
+    else if where == 2
+        t = m.line - h + 1
+    if t < 0
+        t = 0
+    if t != top
+        m.emit(ScrollBy(lines: t - top))

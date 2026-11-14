@@ -1,0 +1,514 @@
+// host_tests.nv — what a host sees: the answer to one key, the protocols for
+// a search and a command line, the text in memory and its undo stack.
+
+use std.test
+use std.list
+use keymodel
+use vimtext
+use vimmodal
+use vimkey
+use vimscroll
+use vimstep
+use vimram
+
+// kind names an action, so that a test can compare the list a step answered.
+fn kind(a: Action) -> Str
+    match a
+        MoveCursor(l, c)         => "MoveCursor"
+        Delete(s)                => "Delete"
+        Insert(l, c, t)          => "Insert"
+        ReplaceChar(l, c, n, ch) => "ReplaceChar"
+        JoinLines(l, n, sp)      => "JoinLines"
+        Indent(f, l, n)          => "Indent"
+        Dedent(f, l, n)          => "Dedent"
+        ChangeCase(s, k)         => "ChangeCase"
+        Yank(s)                  => "Yank"
+        Put(l, c, t, lw)         => "Put"
+        Undo                     => "Undo"
+        Redo                     => "Redo"
+        UndoMark(l, c)           => "UndoMark"
+        SetMode(m)               => "SetMode"
+        Search(f, p, w, n)       => "Search"
+        EnterCommandLine(k, i)   => "EnterCommandLine"
+        ScrollBy(n)              => "ScrollBy"
+        ScrollPage(d, n)         => "ScrollPage"
+        Bell                     => "Bell"
+
+fn kinds(acts: [Action]) -> [Str]
+    var out: [Str] = []
+    for a in acts
+        list.push(out, kind(a))
+    out
+
+// initial_of is the text a command line starts with.
+fn initial_of(acts: [Action]) -> Str
+    for a in acts
+        match a
+            EnterCommandLine(k, initial) =>
+                return initial
+            _                            =>
+                continue
+    "no command line"
+
+// Asked is the search a step asked the host for.
+struct Asked
+    pattern: Str
+    forward: Bool
+    count: Int
+
+fn search_of(acts: [Action]) -> Asked
+    for a in acts
+        match a
+            Search(f, p, w, n) =>
+                return Asked { pattern: p, forward: f, count: n }
+            _                  =>
+                continue
+    Asked { pattern: "no search", forward: false, count: 0 }
+
+fn doc_of(text: [Str]) -> Doc
+    vimram.doc_new(text, 5)
+
+fn step_keys(d: Doc, m0: Modal, keys: Str) -> Step
+    var m = m0
+    var last = vimstep.step_code(m, d, 0)
+    for c in vimkey.codes_of(keys)
+        last = vimstep.step_code(m, d, c)
+        m = last.modal
+    last
+
+@test
+fn test_a_step_answers_a_new_state_and_leaves_the_old_one() [io]
+    let d = doc_of(["abc"])
+    let m = vimmodal.modal_new()
+    let s = vimstep.step(m, d, keymodel.char_key('x'))
+    test.assert_eq(kinds(s.actions), ["UndoMark", "Delete"])
+    test.assert_eq(m.reg_text('"'), "")
+    test.assert_eq(s.modal.reg_text('"'), "a")
+
+@test
+fn test_a_key_that_is_released_or_unknown_changes_nothing() [io]
+    let d = doc_of(["abc"])
+    let m = vimmodal.modal_new()
+    let up = KeyStroke { press: keymodel.key_char('x'),
+        mods: keymodel.no_mods(),
+        motion: keymodel.KEY_UP_EVENT }
+    test.assert_eq(kinds(vimstep.step(m, d, up).actions), [])
+    test.assert_eq(kinds(vimstep.step(m, d, keymodel.named_key(keymodel.KEY_INSERT)).actions), ["Bell"])
+
+@test
+fn test_keys_with_no_command_are_refused() [io]
+    let d = doc_of(["abc"])
+    let m = vimmodal.modal_new()
+    test.case("normal mode")
+    test.assert_eq(kinds(step_keys(d, m, "Z").actions), ["Bell"])
+    test.assert_eq(kinds(step_keys(d, m, "q").actions), ["Bell"])
+    test.assert_eq(kinds(step_keys(d, m, "<C-v>").actions), ["Bell"])
+    test.assert_eq(kinds(step_keys(d, m, "<C-a>").actions), ["Bell"])
+    test.case("visual mode")
+    test.assert_eq(kinds(step_keys(d, m, "vZ").actions), ["Bell"])
+    test.assert_eq(kinds(step_keys(d, m, "vI").actions), ["Bell"])
+    test.assert_eq(kinds(step_keys(d, m, "vA").actions), ["Bell"])
+    test.case("insert mode")
+    test.assert_eq(kinds(step_keys(d, m, "i<C-a>").actions), ["Bell"])
+    test.case("an operator waiting")
+    test.assert_eq(kinds(step_keys(d, m, "dZ").actions), ["Bell"])
+    test.case("a refused key puts the state back to Normal")
+    test.assert_eq(step_keys(d, m, "dZ").modal.mode_of(), vimmodal.MODE_NORMAL)
+
+@test
+fn test_the_mode_a_status_line_shows() [io]
+    let d = doc_of(["abc def"])
+    let m = vimmodal.modal_new()
+    test.assert_eq(step_keys(d, m, "d").modal.mode_of(), vimmodal.MODE_OP_PENDING)
+    test.assert_eq(step_keys(d, m, "g").modal.mode_of(), vimmodal.MODE_OP_PENDING)
+    test.assert_eq(step_keys(d, m, "i").modal.mode_of(), vimmodal.MODE_INSERT)
+    test.assert_eq(step_keys(d, m, "R").modal.mode_of(), vimmodal.MODE_REPLACE)
+    test.assert_eq(step_keys(d, m, "v").modal.mode_of(), vimmodal.MODE_VISUAL)
+    test.assert_eq(step_keys(d, m, "V").modal.mode_of(), vimmodal.MODE_VISUAL_LINE)
+    test.assert_eq(step_keys(d, m, ":").modal.mode_of(), vimmodal.MODE_CMDLINE)
+    test.assert(vimmodal.is_visual(vimmodal.MODE_VISUAL))
+    test.assert(vimmodal.is_visual(vimmodal.MODE_VISUAL_LINE))
+    test.assert(vimmodal.is_visual(vimmodal.MODE_VISUAL_BLOCK))
+    test.assert(vimmodal.is_visual(vimmodal.MODE_INSERT) == false)
+
+@test
+fn test_a_command_line_is_the_hosts() [io]
+    let d = doc_of(["a", "b", "c"])
+    let m = vimmodal.modal_new()
+    test.case("a colon asks for a line")
+    let s = step_keys(d, m, ":")
+    test.assert_eq(kinds(s.actions), ["SetMode", "EnterCommandLine"])
+    test.assert_eq(s.modal.mode, vimmodal.MODE_CMDLINE)
+    test.case("keys are refused while the host holds the line")
+    test.assert_eq(kinds(vimstep.step_code(s.modal, d, 'x').actions), ["Bell"])
+    test.case("finishing returns to Normal mode with nothing more to do")
+    let done = vimstep.cmdline_done(s.modal, d, "w")
+    test.assert_eq(done.modal.mode, vimmodal.MODE_NORMAL)
+    test.assert_eq(kinds(done.actions), ["SetMode"])
+    test.case("aborting returns to Normal mode")
+    let gone = vimstep.cmdline_abort(s.modal)
+    test.assert_eq(gone.modal.mode, vimmodal.MODE_NORMAL)
+    test.case("a command line that is not open is not finished or aborted")
+    test.assert_eq(kinds(vimstep.cmdline_done(m, d, "w").actions), [])
+    test.assert_eq(kinds(vimstep.cmdline_abort(m).actions), [])
+
+@test
+fn test_a_count_before_a_colon_is_a_range() [io]
+    let d = doc_of(["a", "b", "c"])
+    let m = vimmodal.modal_new()
+    test.assert_eq(initial_of(step_keys(d, m, "3:").actions), ".,.+2")
+    test.assert_eq(initial_of(step_keys(d, m, "1:").actions), ".")
+    test.assert_eq(initial_of(step_keys(d, m, ":").actions), "")
+    let sv = step_keys(d, m, "Vj:")
+    test.assert_eq(initial_of(sv.actions), "'<,'>")
+    test.assert_eq(sv.modal.mode, vimmodal.MODE_CMDLINE)
+    test.assert_eq(sv.modal.prev_mode, vimmodal.MODE_NORMAL)
+
+@test
+fn test_a_search_line_asks_the_host_to_search() [io]
+    let d = doc_of(["a", "b", "c"])
+    let m = vimmodal.modal_new()
+    let s = step_keys(d, m, "2/")
+    let e = vimstep.cmdline_done(s.modal, d, "pat")
+    test.assert_eq(kinds(e.actions), ["SetMode", "Search"])
+    let asked = search_of(e.actions)
+    test.assert_eq(asked.pattern, "pat")
+    test.assert(asked.forward)
+    test.assert_eq(asked.count, 2)
+    test.case("backward")
+    let b = vimstep.cmdline_done(step_keys(d, m, "?").modal, d, "q")
+    test.assert(b.modal.search_forward == false)
+
+@test
+fn test_the_answer_to_a_search_moves_the_cursor() [io]
+    let d = doc_of(["abc", "def", "ghi"])
+    let m = vimmodal.modal_new()
+    let wait = step_keys(d, m, "/")
+    let asked = vimstep.cmdline_done(wait.modal, d, "ef")
+    test.assert(asked.modal.search_wait)
+    let found = vimstep.search_found(asked.modal, d, 1, 1)
+    test.assert_eq(found.modal.line, 1)
+    test.assert_eq(found.modal.col, 1)
+    test.assert(found.modal.search_wait == false)
+    test.case("a search that found nothing")
+    let none = vimstep.search_failed(asked.modal, d)
+    test.assert_eq(kinds(none.actions), ["Bell"])
+    test.assert(none.modal.search_wait == false)
+    test.case("an answer nobody asked for")
+    test.assert_eq(kinds(vimstep.search_found(m, d, 1, 1).actions), [])
+    test.assert_eq(kinds(vimstep.search_failed(m, d).actions), [])
+    test.case("a key typed while waiting forgets the search")
+    let typed = vimstep.step_code(asked.modal, d, 'x')
+    test.assert(typed.modal.search_wait == false)
+
+@test
+fn test_a_search_ends_the_range_of_an_operator() [io]
+    var d = doc_of(["ab cd", "ef gh"])
+    var m = vimmodal.modal_new()
+    m = vimram.run(var d, m, "d/gh<CR>")
+    test.assert_eq(vimram.doc_lines(d), ["gh"])
+    test.case("and from Visual mode")
+    var e = doc_of(["ab cd", "ef gh"])
+    var n = vimmodal.modal_new()
+    n = vimram.run(var e, n, "v/ef<CR>d")
+    test.assert_eq(vimram.doc_lines(e), ["f gh"])
+
+@test
+fn test_a_search_in_the_text_in_memory() [io]
+    var d = doc_of(["one two", "two one", "three"])
+    test.case("forward")
+    let a = vimram.doc_search(var d, 0, 0, true, "two", false, 1)
+    test.assert(a.found)
+    test.assert_eq(a.line, 0)
+    test.assert_eq(a.col, 4)
+    test.case("wrapping")
+    let b = vimram.doc_search(var d, 2, 0, true, "one", false, 1)
+    test.assert_eq(b.line, 0)
+    test.case("backward")
+    let c = vimram.doc_search(var d, 0, 0, false, "one", false, 1)
+    test.assert_eq(c.line, 1)
+    test.assert_eq(c.col, 4)
+    test.case("the second match")
+    let e = vimram.doc_search(var d, 0, 0, true, "two", false, 2)
+    test.assert_eq(e.line, 1)
+    test.case("the last pattern again")
+    let f = vimram.doc_search(var d, 0, 0, true, "", false, 1)
+    test.assert_eq(f.line, 0)
+    test.assert_eq(f.col, 4)
+    test.case("not found")
+    let g = vimram.doc_search(var d, 0, 0, true, "zzz", false, 1)
+    test.assert(g.found == false)
+    test.case("a whole word only")
+    var w = doc_of(["catalog cat"])
+    let h = vimram.doc_search(var w, 0, 0, true, "cat", true, 1)
+    test.assert_eq(h.col, 8)
+    test.case("no pattern at all")
+    var z = doc_of(["abc"])
+    let i = vimram.doc_search(var z, 0, 0, true, "", false, 1)
+    test.assert(i.found == false)
+
+@test
+fn test_undo_and_redo_are_the_hosts() [io]
+    var d = doc_of(["abc def"])
+    var m = vimmodal.modal_new()
+    m = vimram.run(var d, m, "x")
+    test.assert_eq(vimram.doc_lines(d), ["bc def"])
+    m = vimram.run(var d, m, "u")
+    test.assert_eq(vimram.doc_lines(d), ["abc def"])
+    m = vimram.run(var d, m, "<C-r>")
+    test.assert_eq(vimram.doc_lines(d), ["bc def"])
+    test.case("undo with nothing to undo")
+    var e = doc_of(["abc"])
+    var n = vimmodal.modal_new()
+    n = vimram.run(var e, n, "u")
+    test.assert_eq(vimram.doc_lines(e), ["abc"])
+    test.case("redo with nothing to redo")
+    n = vimram.run(var e, n, "<C-r>")
+    test.assert_eq(vimram.doc_lines(e), ["abc"])
+    test.case("undo on another line puts the cursor on the changed line")
+    var f = doc_of(["one", "two", "three"])
+    var o = vimmodal.modal_new()
+    o = vimram.run(var f, o, "jjdd")
+    o = vimram.run(var f, o, "gg")
+    o = vimram.run(var f, o, "u")
+    test.assert_eq(o.line, 2)
+    test.case("a change redone from another place")
+    o = vimram.run(var f, o, "gg<C-r>")
+    test.assert_eq(vimram.doc_lines(f), ["one", "two"])
+    test.assert_eq(o.line, 1)
+
+@test
+fn test_the_cursor_can_be_set_and_settled() [io]
+    let d = doc_of(["abc", "  def", ""])
+    var m = vimmodal.modal_new()
+    m = vimstep.set_cursor(m, d, 9, 9)
+    test.assert_eq(m.line, 2)
+    test.assert_eq(m.col, 0)
+    m = vimstep.set_cursor(m, d, 1, 99)
+    test.assert_eq(m.line, 1)
+    test.assert_eq(m.col, 4)
+    m = vimstep.set_cursor(m, d, 0 - 3, 0 - 3)
+    test.assert_eq(m.line, 0)
+    test.assert_eq(m.col, 0)
+    test.case("settle clamps and finds the first non-blank column")
+    var n = vimmodal.modal_clone(m)
+    n.line = 1
+    n.col = 0
+    n.nonblank = true
+    let s = vimstep.settle(n, d)
+    test.assert_eq(s.col, 2)
+    test.case("in Insert mode the cursor may be after the last character")
+    var i = vimmodal.modal_clone(m)
+    i.mode = vimmodal.MODE_INSERT
+    i.col = 99
+    test.assert_eq(vimstep.settle(i, d).col, 3)
+    i.col = 0 - 4
+    test.assert_eq(vimstep.settle(i, d).col, 0)
+    test.case("in Visual mode too")
+    var v = vimmodal.modal_clone(m)
+    v.mode = vimmodal.MODE_VISUAL
+    v.col = 3
+    test.assert_eq(vimstep.settle(v, d).col, 3)
+
+@test
+fn test_the_text_in_memory_clamps_places() [io]
+    let d = doc_of(["abc", ""])
+    test.assert_eq(d.clamp_normal(vimtext.pos_new(0 - 2, 5)).line, 0)
+    test.assert_eq(d.clamp_normal(vimtext.pos_new(9, 5)).line, 1)
+    test.assert_eq(d.clamp_normal(vimtext.pos_new(0, 5)).col, 2)
+    test.assert_eq(d.clamp_normal(vimtext.pos_new(0, 0 - 5)).col, 0)
+    test.assert_eq(d.clamp_insert(vimtext.pos_new(0 - 2, 5)).line, 0)
+    test.assert_eq(d.clamp_insert(vimtext.pos_new(9, 5)).line, 1)
+    test.assert_eq(d.clamp_insert(vimtext.pos_new(0, 0 - 5)).col, 0)
+    test.case("the first and last non-blank columns")
+    let e = doc_of(["  ab  ", "   ", ""])
+    test.assert_eq(e.first_nonblank(0), 2)
+    test.assert_eq(e.first_nonblank(1), 2)
+    test.assert_eq(e.first_nonblank(2), 0)
+    test.assert_eq(e.last_nonblank(0), 3)
+    test.assert_eq(e.last_nonblank(2), 0)
+    test.case("a text of no lines has one")
+    let none = vimram.doc_new([], 5)
+    test.assert_eq(none.line_count(), 1)
+    test.assert_eq(none.len_at(7), 0)
+    test.assert_eq(none.ch(7, 0), 0 - 1)
+
+@test
+fn test_the_window_scrolls_by_the_rules_of_the_editor() [io]
+    var d = vimram.doc_new(["a", "b", "c", "d", "e", "f", "g", "h"], 4)
+    var m = vimmodal.modal_new()
+    test.case("the window may scroll until the last line is at its top")
+    m = vimram.run(var d, m, "20<C-e>")
+    test.assert_eq(d.top, 7)
+    m = vimram.run(var d, m, "20<C-y>")
+    test.assert_eq(d.top, 0)
+    test.case("half a window")
+    m = vimram.run(var d, m, "<C-d>")
+    test.assert_eq(d.top, 2)
+    test.assert_eq(m.line, 5)
+    test.case("a page keeps two lines in view")
+    m = vimram.run(var d, m, "<C-f>")
+    test.assert_eq(d.top, 4)
+    m = vimram.run(var d, m, "<C-b>")
+    test.assert_eq(d.top, 2)
+    test.case("the cursor line goes to the top, the middle or the bottom")
+    m = vimram.run(var d, m, "jjzt")
+    test.assert_eq(d.top, 7)
+    m = vimram.run(var d, m, "zz")
+    test.assert_eq(d.top, 6)
+    m = vimram.run(var d, m, "zb")
+    test.assert_eq(d.top, 4)
+
+@test
+fn test_a_window_of_one_line() [io]
+    var d = vimram.doc_new(["a", "b", "c"], 1)
+    var m = vimmodal.modal_new()
+    m = vimram.run(var d, m, "<C-d>")
+    test.assert_eq(d.top, 1)
+    test.assert_eq(m.line, 1)
+    m = vimram.run(var d, m, "<C-f>")
+    test.assert_eq(d.top, 2)
+    test.assert_eq(m.line, 2)
+    m = vimram.run(var d, m, "<C-b>")
+    test.assert_eq(d.top, 1)
+    test.assert_eq(m.line, 1)
+
+@test
+fn test_scrolling_from_a_cursor_in_a_long_line() [io]
+    var d = vimram.doc_new(["a long first line", "xy", "z", "another long line", "q", "r", "s"], 3)
+    var m = vimmodal.modal_new()
+    m = vimram.run(var d, m, "$<C-e>")
+    test.assert_eq(m.line, 1)
+    test.assert_eq(m.col, 1)
+    m = vimstep.set_cursor(m, d, 0, 12)
+    m = vimram.run(var d, m, "<C-y>")
+    test.assert_eq(d.top, 0)
+    test.case("scrolling off a line with no characters")
+    var e = vimram.doc_new(["abc", "", "def", "ghi"], 2)
+    var n = vimmodal.modal_new()
+    n = vimstep.set_cursor(n, e, 0, 2)
+    n = vimram.run(var e, n, "<C-e>")
+    n = vimram.run(var e, n, "<C-e>")
+    test.assert_eq(n.line, 2)
+
+@test
+fn test_a_page_forward_from_the_last_line_is_refused() [io]
+    var d = vimram.doc_new(["a", "b"], 5)
+    var m = vimmodal.modal_new()
+    m = vimram.run(var d, m, "<C-d>")
+    test.assert_eq(d.bells, 0)
+    m = vimram.run(var d, m, "<C-d>")
+    test.assert_eq(d.bells, 1)
+    var e = vimram.doc_new(["a", "b"], 5)
+    e.top = 1
+    var n = vimmodal.modal_new()
+    n = vimram.run(var e, n, "<C-f>")
+    test.assert_eq(e.bells, 1)
+    n = vimram.run(var e, n, "<C-u>")
+    test.assert_eq(e.bells, 2)
+    var f = vimram.doc_new(["a", "b"], 5)
+    var o = vimmodal.modal_new()
+    o = vimram.run(var f, o, "<C-b>")
+    test.assert_eq(f.bells, 1)
+    o = vimram.run(var f, o, "<C-u>")
+    test.assert_eq(f.bells, 2)
+
+@test
+fn test_the_page_the_window_moves_by() [io]
+    test.assert_eq(vimscroll.page_top(0, 22, 100, true, 1), 20)
+    test.assert_eq(vimscroll.page_top(20, 22, 100, false, 1), 0)
+    test.assert_eq(vimscroll.page_top(5, 22, 100, false, 1), 0)
+    test.assert_eq(vimscroll.page_top(0, 22, 100, true, 9), 99)
+    test.assert_eq(vimscroll.page_top(90, 22, 100, true, 1), 99)
+    test.assert_eq(vimscroll.page_top(0, 2, 100, true, 1), 1)
+    test.assert_eq(vimscroll.page_top(99, 22, 100, false, 1), 77)
+    test.assert_eq(vimscroll.page_top(0, 22, 0, true, 1), 0)
+
+@test
+fn test_case_changes_in_the_text_in_memory() [io]
+    var d = doc_of(["\u{3b1}\u{3b2}\u{3b3} \u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} \u{e9}\u{f6}"])
+    var m = vimmodal.modal_new()
+    m = vimram.run(var d, m, "gUU")
+    test.assert_eq(vimram.doc_lines(d),
+        ["\u{391}\u{392}\u{393} \u{41f}\u{420}\u{418}\u{412}\u{415}\u{422} \u{c9}\u{d6}"])
+    m = vimram.run(var d, m, "guu")
+    test.assert_eq(vimram.doc_lines(d),
+        ["\u{3b1}\u{3b2}\u{3b3} \u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} \u{e9}\u{f6}"])
+    m = vimram.run(var d, m, "g~~")
+    test.assert_eq(vimram.doc_lines(d),
+        ["\u{391}\u{392}\u{393} \u{41f}\u{420}\u{418}\u{412}\u{415}\u{422} \u{c9}\u{d6}"])
+
+@test
+fn test_the_text_in_memory_keeps_its_window_inside_the_text() [io]
+    var d = doc_of(["a", "b", "c"])
+    vimram.doc_apply(var d, ScrollBy(lines: 99))
+    test.assert_eq(d.top, 2)
+    vimram.doc_apply(var d, ScrollBy(lines: 0 - 99))
+    test.assert_eq(d.top, 0)
+
+@test
+fn test_the_text_in_memory_puts_lines_after_the_last() [io]
+    var d = doc_of(["a", "b"])
+    vimram.doc_apply(var d, Put(line: 99, col: 0, text: "c", linewise: true))
+    test.assert_eq(vimram.doc_lines(d), ["a", "b", "c"])
+
+@test
+fn test_the_text_in_memory_ignores_what_is_not_the_text() [io]
+    var d = doc_of(["a", "b"])
+    vimram.doc_apply(var d, MoveCursor(line: 1, col: 0))
+    vimram.doc_apply(var d, Yank(span: Span.lines(0, 1)))
+    vimram.doc_apply(var d, Undo)
+    vimram.doc_apply(var d, Redo)
+    vimram.doc_apply(var d, SetMode(mode: vimmodal.MODE_INSERT))
+    vimram.doc_apply(var d, Search(forward: true, pattern: "a", whole_word: false, count: 1))
+    vimram.doc_apply(var d, EnterCommandLine(kind: vimmodal.CMDLINE_EX, initial: ""))
+    test.assert_eq(vimram.doc_lines(d), ["a", "b"])
+    test.assert_eq(d.bells, 0)
+
+// Empty is a text that reports no lines at all.
+struct Empty
+    rows: Int
+
+impl TextView for Empty
+    fn line_count(self) -> Int
+        0
+
+    fn line_len(self, line: Int) -> Int
+        0
+
+    fn char_at(self, line: Int, col: Int) -> Int
+        0 - 1
+
+    fn top_line(self) -> Int
+        0
+
+    fn height(self) -> Int
+        self.rows
+
+@test
+fn test_a_text_with_no_lines_has_a_last_line_of_zero() [io]
+    let e = Empty { rows: 3 }
+    test.assert_eq(e.last_line(), 0)
+    test.assert_eq(e.len_at(0), 0)
+    let m = vimmodal.modal_new()
+    let s = vimstep.step_code(m, e, 'x')
+    test.assert_eq(s.modal.line, 0)
+
+@test
+fn test_a_mark_on_a_line_that_is_gone_is_the_last_line() [io]
+    var d = doc_of(["a", "b", "c"])
+    var m = vimmodal.modal_new()
+    m = vimram.run(var d, m, "Gma")
+    m = vimram.run(var d, m, "ggJJ")
+    test.assert_eq(vimram.doc_lines(d), ["a b c"])
+    m = vimram.run(var d, m, "'a")
+    test.assert_eq(m.line, 0)
+
+@test
+fn test_a_keystroke_in_every_mode_is_a_step() [io]
+    let d = doc_of(["abc"])
+    var m = vimmodal.modal_new()
+    for c in vimkey.codes_of("ix<Esc>vl<Esc>Vd")
+        let s = vimstep.step(m, d, vimkey.stroke_of_code(c))
+        m = s.modal
+    test.assert_eq(m.mode, vimmodal.MODE_NORMAL)

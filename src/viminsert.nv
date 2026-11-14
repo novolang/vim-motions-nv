@@ -1,0 +1,285 @@
+// viminsert.nv — Insert mode and Replace mode.
+//
+// Typing in Insert mode puts the text in at once: each key is an action,
+// and the cursor is where the next character goes.  The text typed since
+// the mode began is kept, so that the dot command can type it again.  A
+// Backspace takes the last typed character off that text, and one that goes
+// back past the start of what was typed is not remembered.
+//
+// A count typed before the command that began the insert, as in `3ix`, makes
+// the escape type the text again that many times in all.
+//
+// Replace mode writes over the characters it meets.  It remembers what it
+// wrote over, so that Backspace puts the original character back.
+
+use std.list
+use std.str
+use vimtext
+use vimmodal
+use vimkey
+
+// The prefix value of Insert mode waiting for the name of a register after
+// `Ctrl-R`.
+pub const PREFIX_INSERT_REGISTER = 18
+
+// insert_start begins an insert at the cursor.  `count` is the number of
+// times the typed text will be entered, one for most commands.  While the
+// dot command is repeating a change, the text recorded with it is entered
+// at once and the mode is left again.
+pub fn insert_start<V: TextView>(var m: Modal, view: V, mode: Int, count: Int, lead: Int)
+    m.ins_text = []
+    m.ins_orig = []
+    m.ins_lead = lead
+    m.ins_count = count
+    m.ins_line = m.line
+    m.ins_col = m.col
+    m.prefix = 0
+    m.count = 0
+    m.op_count = 0
+    m.op = OP_NONE
+    if m.replaying
+        m.set_mode(mode)
+        replay_text(var m, view)
+        insert_finish(var m, view)
+    else
+        m.set_mode(mode)
+
+// advance moves the cursor over text that has been inserted at it.
+fn advance(var m: Modal, cps: [Int])
+    for c in cps
+        if c == '\n'
+            m.line = m.line + 1
+            m.col = 0
+        else
+            m.col = m.col + 1
+
+// put_text enters text at the cursor.
+fn put_text(var m: Modal, cps: [Int])
+    if list.len(cps) > 0
+        m.emit(Insert(line: m.line, col: m.col, text: vimtext.encode_utf8(cps)))
+        advance(var m, cps)
+
+// replay_text enters the text recorded with the last change, as many times
+// as the count says.
+fn replay_text<V: TextView>(var m: Modal, view: V)
+    let text = list.clone(m.dot_text)
+    var i = 0
+    while i < m.ins_count
+        enter_text(var m, view, repeat_of(m, text, i))
+        i = i + 1
+    m.ins_text = list.clone(text)
+    m.ins_count = 1
+
+// enter_text types text at the cursor: it is inserted in Insert mode and
+// written over what is there in Replace mode.
+fn enter_text<V: TextView>(var m: Modal, view: V, cps: [Int])
+    if m.mode == MODE_REPLACE
+        for c in cps
+            replace_char(var m, view, c)
+    else
+        put_text(var m, cps)
+
+// repeat_of is the text entered the `i`th time: the first time exactly what
+// was typed, and later times that text again, begun with the line break
+// that opened the line when the command was `o` or `O`.
+fn repeat_of(m: Modal, text: [Int], i: Int) -> [Int]
+    if i > 0 and m.ins_lead != 0
+        [m.ins_lead, ...text]
+    else
+        list.clone(text)
+
+// insert_finish leaves Insert or Replace mode.  The text typed is entered
+// again for a count, and the cursor steps back onto the last character.
+pub fn insert_finish<V: TextView>(var m: Modal, view: V)
+    if not m.replaying
+        m.dot_text = list.clone(m.ins_text)
+    if m.ins_count > 1 and not m.replaying
+        let text = list.clone(m.ins_text)
+        var i = 1
+        while i < m.ins_count
+            enter_text(var m, view, repeat_of(m, text, i))
+            i = i + 1
+    if m.col > 0
+        m.col = m.col - 1
+    m.want = m.col
+    m.nonblank = false
+    m.ins_count = 1
+    m.ins_text = []
+    m.ins_orig = []
+    m.prefix = 0
+    m.set_mode(MODE_NORMAL)
+
+// typed records a character as part of the text typed.
+fn typed(var m: Modal, c: Int)
+    list.push(m.ins_text, c)
+
+// insert_char enters one character at the cursor.
+fn insert_char(var m: Modal, c: Int)
+    m.emit(Insert(line: m.line, col: m.col, text: str.from_char(c)))
+    if c == '\n'
+        m.line = m.line + 1
+        m.col = 0
+    else
+        m.col = m.col + 1
+    typed(var m, c)
+
+// replace_char writes one character over the one at the cursor, or after the
+// end of the line.
+fn replace_char<V: TextView>(var m: Modal, view: V, c: Int)
+    if c == '\n'
+        insert_char(var m, c)
+        list.push(m.ins_orig, 0 - 1)
+        return
+    let n = view.len_at(m.line)
+    if m.col < n
+        list.push(m.ins_orig, view.char_at(m.line, m.col))
+        m.emit(ReplaceChar(line: m.line, col: m.col, count: 1, ch: c))
+        m.col = m.col + 1
+        typed(var m, c)
+    else
+        list.push(m.ins_orig, 0 - 1)
+        insert_char(var m, c)
+
+// backspace deletes the character before the cursor, or joins the line with
+// the one before.  In Replace mode it puts the original character back.
+fn backspace<V: TextView>(var m: Modal, view: V)
+    let replacing = m.mode == MODE_REPLACE
+    if replacing
+        let k = list.len(m.ins_orig)
+        if k == 0
+            if m.col > 0
+                m.col = m.col - 1
+            else if m.line > 0
+                m.line = m.line - 1
+                m.col = view.len_at(m.line)
+            return
+        let orig = m.ins_orig[k - 1]
+        m.ins_orig = m.ins_orig[0:k - 1]
+        if orig == 0 - 1
+            m.emit(Delete(span: Span.chars(m.line, m.col - 1, m.line, m.col)))
+        else
+            m.emit(ReplaceChar(line: m.line, col: m.col - 1, count: 1, ch: orig))
+        m.col = m.col - 1
+        let t = list.len(m.ins_text)
+        if t > 0
+            m.ins_text = m.ins_text[0:t - 1]
+        return
+    if m.col > 0
+        m.emit(Delete(span: Span.chars(m.line, m.col - 1, m.line, m.col)))
+        m.col = m.col - 1
+    else if m.line > 0
+        let prev = view.len_at(m.line - 1)
+        m.emit(Delete(span: Span.chars(m.line - 1, prev, m.line, 0)))
+        m.line = m.line - 1
+        m.col = prev
+    else
+        return
+    let t = list.len(m.ins_text)
+    if t > 0
+        m.ins_text = m.ins_text[0:t - 1]
+
+// delete_back deletes the columns from `from_col` up to the cursor.
+fn delete_back(var m: Modal, from_col: Int)
+    if from_col >= m.col
+        return
+    m.emit(Delete(span: Span.chars(m.line, from_col, m.line, m.col)))
+    var k = m.col - from_col
+    while k > 0 and list.len(m.ins_text) > 0
+        let t = list.len(m.ins_text)
+        m.ins_text = m.ins_text[0:t - 1]
+        k = k - 1
+    m.col = from_col
+
+// delete_word_back is `Ctrl-W`: it deletes the word before the cursor, and
+// the blanks between that word and the cursor.
+fn delete_word_back<V: TextView>(var m: Modal, view: V)
+    if m.col == 0
+        backspace(var m, view)
+        return
+    var c = m.col
+    while c > 0 and vimtext.is_blank(view.char_at(m.line, c - 1))
+        c = c - 1
+    if c > 0
+        let k = view.cls_at(m.line, c - 1, false)
+        while c > 0 and view.cls_at(m.line, c - 1, false) == k
+            c = c - 1
+    delete_back(var m, c)
+
+// delete_line_back is `Ctrl-U`: it deletes the text entered on this line
+// before the cursor, or when there is none, all of the line before the
+// cursor.
+fn delete_line_back(var m: Modal)
+    var from_col = 0
+    if m.line == m.ins_line and m.ins_col < m.col
+        from_col = m.ins_col
+    delete_back(var m, from_col)
+
+// move_cursor moves the cursor in Insert mode.  The text typed so far is
+// not carried across the move.
+fn move_cursor<V: TextView>(var m: Modal, view: V, line: Int, col: Int)
+    let p = view.clamp_insert(vimtext.pos_new(line, col))
+    m.line = p.line
+    m.col = p.col
+    m.want = p.col
+    m.ins_text = []
+    m.ins_orig = []
+    m.ins_line = p.line
+    m.ins_col = p.col
+    m.emit(MoveCursor(line: p.line, col: p.col))
+
+// insert_register enters the text of a register as if it had been typed.
+fn insert_register(var m: Modal, name: Int)
+    var cps = vimtext.decode_utf8(m.reg_text(name))
+    if m.reg_is_linewise(name)
+        list.push(cps, '\n')
+    put_text(var m, cps)
+    for c in cps
+        typed(var m, c)
+
+// insert_key handles one key in Insert mode or Replace mode.
+pub fn insert_key<V: TextView>(var m: Modal, view: V, code: Int)
+    if m.prefix == PREFIX_INSERT_REGISTER
+        m.prefix = 0
+        if code != K_ESC
+            insert_register(var m, code)
+        return
+    let replacing = m.mode == MODE_REPLACE
+    if code == K_ESC or code == 3
+        insert_finish(var m, view)
+    else if code == K_ENTER or code == 10
+        if replacing
+            replace_char(var m, view, '\n')
+        else
+            insert_char(var m, '\n')
+    else if code == K_BS
+        backspace(var m, view)
+    else if code == K_DELETE
+        if m.col < view.len_at(m.line)
+            m.emit(Delete(span: Span.chars(m.line, m.col, m.line, m.col + 1)))
+        else if m.line < view.last_line()
+            m.emit(Delete(span: Span.chars(m.line, m.col, m.line + 1, 0)))
+    else if code == C_W
+        delete_word_back(var m, view)
+    else if code == C_U
+        delete_line_back(var m)
+    else if code == C_R
+        m.prefix = PREFIX_INSERT_REGISTER
+    else if code == K_LEFT
+        move_cursor(var m, view, m.line, m.col - 1)
+    else if code == K_RIGHT
+        move_cursor(var m, view, m.line, m.col + 1)
+    else if code == K_UP
+        move_cursor(var m, view, m.line - 1, m.col)
+    else if code == K_DOWN
+        move_cursor(var m, view, m.line + 1, m.col)
+    else if code == K_HOME
+        move_cursor(var m, view, m.line, 0)
+    else if code == K_END
+        move_cursor(var m, view, m.line, view.len_at(m.line))
+    else if code == K_TAB or code >= 32 and code != 127 and code < KEY_NAMED
+        if replacing
+            replace_char(var m, view, code)
+        else
+            insert_char(var m, code)
+    else
+        m.emit(Bell)

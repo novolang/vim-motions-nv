@@ -1,0 +1,930 @@
+// vimmotion.nv — the motions: where a cursor goes, as a function of the text.
+//
+// A motion reads the text and a start place and answers a `Mv`: the place it
+// reaches, and the facts an operator needs to turn the move into a range.
+// A motion that is linewise takes whole lines.  A motion that is inclusive
+// takes the character it ends on, and one that is not takes the characters
+// up to it.  A motion that fails, because there is nowhere to go, answers
+// `ok` false; the place in the answer is where the cursor ends up all the
+// same, which is where Vim leaves it.
+//
+// The word, paragraph and character motions follow the algorithms of
+// Vim's `search.c`, `textobject.c` and `ops.c`; the comments name the Vim
+// function each one corresponds to.
+
+use vimtext.*
+
+// WANT_FROM_COL is a `Mv.want` that sets the wanted column to the column the
+// motion ended on.
+pub const WANT_FROM_COL = 0 - 3
+
+// WANT_KEEP is a `Mv.want` that leaves the wanted column as it was.
+pub const WANT_KEEP = 0 - 2
+
+// Mv is the result of a motion.
+pub @value
+struct Mv
+    ok: Bool
+    line: Int
+    col: Int
+    linewise: Bool
+    inclusive: Bool
+    jump: Bool
+    big: Bool
+    want: Int
+
+// mv_at is a successful characterwise, exclusive motion that ends at a
+// place.
+pub fn mv_at(line: Int, col: Int) -> Mv
+    Mv { ok: true, line: line, col: col, linewise: false, inclusive: false,
+         jump: false, big: false, want: WANT_FROM_COL }
+
+// mv_incl is a successful characterwise, inclusive motion.
+pub fn mv_incl(line: Int, col: Int) -> Mv
+    Mv { ok: true, line: line, col: col, linewise: false, inclusive: true,
+         jump: false, big: false, want: WANT_FROM_COL }
+
+// mv_lines is a successful linewise motion.
+pub fn mv_lines(line: Int, col: Int, want: Int) -> Mv
+    Mv { ok: true, line: line, col: col, linewise: true, inclusive: false,
+         jump: false, big: false, want: want }
+
+// mv_fail is a motion that did not go anywhere.
+pub fn mv_fail(line: Int, col: Int) -> Mv
+    Mv { ok: false, line: line, col: col, linewise: false, inclusive: false,
+         jump: false, big: false, want: WANT_FROM_COL }
+
+// ── Stepping over characters ─────────────────────────────────────────
+
+// Inc is a place and how a one-character step reached it: 0 for a step
+// within a line, 2 for a step onto the end of the line, 1 for a step to the
+// next line, and -1 for no step because the text ended.
+pub @value
+struct Inc
+    line: Int
+    col: Int
+    r: Int
+
+// inc_pos steps one character forward, as Vim's `inc`.  The place after the
+// last character of a line is a place of its own, and a step from it goes to
+// the next line.
+pub fn inc_pos<V: TextView>(view: V, line: Int, col: Int) -> Inc
+    let n = view.len_at(line)
+    if col < n
+        let c2 = col + 1
+        Inc { line: line, col: c2, r: (if c2 < n then 0 else 2) }
+    else if line < view.last_line()
+        Inc { line: line + 1, col: 0, r: 1 }
+    else
+        Inc { line: line, col: col, r: 0 - 1 }
+
+// dec_pos steps one character back, as Vim's `dec`.  A step back from the
+// start of a line lands after the last character of the line before.
+pub fn dec_pos<V: TextView>(view: V, line: Int, col: Int) -> Inc
+    if col > 0
+        Inc { line: line, col: col - 1, r: 0 }
+    else if line > 0
+        Inc { line: line - 1, col: view.len_at(line - 1), r: 1 }
+    else
+        Inc { line: line, col: col, r: 0 - 1 }
+
+// ── Word motions ────────────────────────────────────────────────────
+
+// fwd_word is Vim's `fwd_word`: `count` words forward to the start of a word.
+// An empty line is a word.  With `eol` set, the last word of the count stops
+// at the end of its line.
+pub fn fwd_word<V: TextView>(view: V, start: Pos, count: Int, big: Bool, eol: Bool) -> Mv
+    var l = start.line
+    var c = start.col
+    var left = count
+    while left > 0
+        left = left - 1
+        let sclass = view.cls_at(l, c, big)
+        let last_line_here = l == view.last_line()
+        var s = inc_pos(view, l, c)
+        l = s.line
+        c = s.col
+        if s.r == 0 - 1 or s.r >= 1 and last_line_here
+            return mv_fail(l, c)
+        if s.r >= 1 and eol and left == 0
+            return mv_at(l, c)
+        if sclass != CLASS_BLANK
+            while view.cls_at(l, c, big) == sclass
+                s = inc_pos(view, l, c)
+                l = s.line
+                c = s.col
+                if s.r == 0 - 1 or s.r >= 1 and eol and left == 0
+                    return mv_at(l, c)
+        while view.cls_at(l, c, big) == CLASS_BLANK
+            if c == 0 and view.len_at(l) == 0
+                break
+            s = inc_pos(view, l, c)
+            l = s.line
+            c = s.col
+            if s.r == 0 - 1 or s.r >= 1 and eol and left == 0
+                return mv_at(l, c)
+    mv_at(l, c)
+
+// bck_word is Vim's `bck_word`: `count` words back to the start of a word.
+// An empty line is a word.
+pub fn bck_word<V: TextView>(view: V, start: Pos, count: Int, big: Bool, stop_in: Bool) -> Mv
+    var l = start.line
+    var c = start.col
+    var stop = stop_in
+    var left = count
+    while left > 0
+        left = left - 1
+        let sclass = view.cls_at(l, c, big)
+        var s = dec_pos(view, l, c)
+        l = s.line
+        c = s.col
+        if s.r == 0 - 1
+            return mv_fail(l, c)
+        var finished = false
+        if not stop or sclass == view.cls_at(l, c, big) or sclass == CLASS_BLANK
+            while view.cls_at(l, c, big) == CLASS_BLANK
+                if c == 0 and view.len_at(l) == 0
+                    finished = true
+                    break
+                s = dec_pos(view, l, c)
+                l = s.line
+                c = s.col
+                if s.r == 0 - 1
+                    return mv_at(l, c)
+            if not finished
+                let k = view.cls_at(l, c, big)
+                while view.cls_at(l, c, big) == k
+                    s = dec_pos(view, l, c)
+                    l = s.line
+                    c = s.col
+                    if s.r == 0 - 1
+                        return mv_at(l, c)
+        if not finished
+            s = inc_pos(view, l, c)
+            l = s.line
+            c = s.col
+        stop = false
+    mv_at(l, c)
+
+// end_word is Vim's `end_word`: `count` words forward to the end of a word.
+// With `empty` set an empty line is a word.
+pub fn end_word<V: TextView>(view: V, start: Pos, count: Int, big: Bool, stop_in: Bool,
+                             empty: Bool) -> Mv
+    var l = start.line
+    var c = start.col
+    var stop = stop_in
+    var left = count
+    while left > 0
+        left = left - 1
+        let sclass = view.cls_at(l, c, big)
+        var s = inc_pos(view, l, c)
+        l = s.line
+        c = s.col
+        if s.r == 0 - 1
+            return mv_fail(l, c)
+        var finished = false
+        if view.cls_at(l, c, big) == sclass and sclass != CLASS_BLANK
+            while view.cls_at(l, c, big) == sclass
+                s = inc_pos(view, l, c)
+                l = s.line
+                c = s.col
+        else if not stop or sclass == CLASS_BLANK
+            while view.cls_at(l, c, big) == CLASS_BLANK
+                if empty and c == 0 and view.len_at(l) == 0
+                    finished = true
+                    break
+                s = inc_pos(view, l, c)
+                l = s.line
+                c = s.col
+                if s.r == 0 - 1
+                    return mv_fail(l, c)
+            if not finished
+                let k = view.cls_at(l, c, big)
+                while view.cls_at(l, c, big) == k
+                    s = inc_pos(view, l, c)
+                    l = s.line
+                    c = s.col
+        if not finished
+            s = dec_pos(view, l, c)
+            l = s.line
+            c = s.col
+        stop = false
+    mv_at(l, c)
+
+// bckend_word is Vim's `bckend_word`: `count` words back to the end of a
+// word, which `ge` does.
+pub fn bckend_word<V: TextView>(view: V, start: Pos, count: Int, big: Bool, eol: Bool) -> Mv
+    var l = start.line
+    var c = start.col
+    var left = count
+    while left > 0
+        left = left - 1
+        let sclass = view.cls_at(l, c, big)
+        var s = dec_pos(view, l, c)
+        l = s.line
+        c = s.col
+        if s.r == 0 - 1
+            return mv_fail(l, c)
+        if eol and s.r == 1
+            return mv_at(l, c)
+        if sclass != CLASS_BLANK
+            while view.cls_at(l, c, big) == sclass
+                s = dec_pos(view, l, c)
+                l = s.line
+                c = s.col
+                if s.r == 0 - 1 or eol and s.r == 1
+                    return mv_at(l, c)
+        while view.cls_at(l, c, big) == CLASS_BLANK
+            if c == 0 and view.len_at(l) == 0
+                break
+            s = dec_pos(view, l, c)
+            l = s.line
+            c = s.col
+            if s.r == 0 - 1 or eol and s.r == 1
+                return mv_at(l, c)
+    mv_at(l, c)
+
+// settle_word finishes a word motion as Vim's `nv_wordcmd` does: a motion
+// that ended after the last character of a line comes back onto that
+// character and becomes inclusive.
+fn settle_word<V: TextView>(view: V, start: Pos, r: Mv, inclusive: Bool, op_pending: Bool,
+                            visual: Bool) -> Mv
+    var l = r.line
+    var c = r.col
+    var incl = inclusive
+    if vimtext.pos_before(start, vimtext.pos_new(l, c)) and not visual
+        if c > 0 and c >= view.len_at(l)
+            c = c - 1
+            incl = true
+    Mv { ok: r.ok or op_pending, line: l, col: c, linewise: false, inclusive: incl,
+         jump: false, big: false, want: WANT_FROM_COL }
+
+// motion_w is `w` and `W`.  With `op_pending` set the motion stops at the end
+// of a line the way an operator wants.  With `change` set it is the motion of
+// `cw` and `cW`, which on a word reaches only its end, as `e` does.
+pub fn motion_w<V: TextView>(view: V, start: Pos, count: Int, big: Bool, op_pending: Bool,
+                             change: Bool, visual: Bool) -> Mv
+    var word_end = false
+    var flag = false
+    var inclusive = false
+    if change
+        let cc = view.ch(start.line, start.col)
+        if cc != NO_CHAR and not vimtext.is_blank(cc)
+            inclusive = true
+            word_end = true
+            flag = true
+    let r = if word_end
+        end_word(view, start, count, big, flag, false)
+    else
+        fwd_word(view, start, count, big, op_pending)
+    settle_word(view, start, r, inclusive, op_pending, visual)
+
+// motion_e is `e` and `E`.
+pub fn motion_e<V: TextView>(view: V, start: Pos, count: Int, big: Bool, op_pending: Bool,
+                             visual: Bool) -> Mv
+    let r = end_word(view, start, count, big, false, false)
+    settle_word(view, start, r, true, op_pending, visual)
+
+// motion_b is `b` and `B`.
+pub fn motion_b<V: TextView>(view: V, start: Pos, count: Int, big: Bool) -> Mv
+    let r = bck_word(view, start, count, big, false)
+    Mv { ok: r.ok, line: r.line, col: r.col, linewise: false, inclusive: false,
+         jump: false, big: false, want: WANT_FROM_COL }
+
+// motion_ge is `ge` and `gE`.
+pub fn motion_ge<V: TextView>(view: V, start: Pos, count: Int, big: Bool) -> Mv
+    let r = bckend_word(view, start, count, big, false)
+    Mv { ok: r.ok, line: r.line, col: r.col, linewise: false, inclusive: true,
+         jump: false, big: false, want: WANT_FROM_COL }
+
+// ── Left, right, up, down ───────────────────────────────────────────
+
+// motion_h is `h`.  It goes as far left as the count allows and fails only
+// when it could not move at all.
+pub fn motion_h(start: Pos, count: Int, op_pending: Bool) -> Mv
+    if start.col <= 0
+        if op_pending
+            return mv_at(start.line, start.col)
+        return mv_fail(start.line, start.col)
+    var c = start.col - count
+    if c < 0
+        c = 0
+    mv_at(start.line, c)
+
+// motion_l is `l`.  Without an operator it stops on the last character of
+// the line.  With one it may go past it, so that `dl` on the last character
+// takes it.
+pub fn motion_l<V: TextView>(view: V, start: Pos, count: Int, op_pending: Bool, visual: Bool) -> Mv
+    let n = view.len_at(start.line)
+    if n == 0
+        if op_pending
+            return mv_at(start.line, 0)
+        return mv_fail(start.line, 0)
+    if visual and not op_pending
+        if start.col >= n
+            return mv_fail(start.line, start.col)
+        var vc = start.col + count
+        if vc > n
+            vc = n
+        return mv_at(start.line, vc)
+    if op_pending
+        var e = start.col + count
+        if e > n
+            e = n
+        return mv_at(start.line, e)
+    if start.col >= n - 1
+        return mv_fail(start.line, start.col)
+    var c = start.col + count
+    if c > n - 1
+        c = n - 1
+    mv_at(start.line, c)
+
+// motion_j is `j` and `k`: `delta` lines down, which is negative for up.
+// It fails only when the cursor is already on the first or the last line.
+pub fn motion_j<V: TextView>(view: V, start: Pos, delta: Int, want: Int) -> Mv
+    let last = view.last_line()
+    if delta > 0 and start.line >= last or delta < 0 and start.line <= 0
+        return mv_fail(start.line, start.col)
+    var l = start.line + delta
+    if l > last
+        l = last
+    if l < 0
+        l = 0
+    let n = view.len_at(l)
+    let w = if want == WANT_END
+        n - 1
+    else
+        want
+    var c = w
+    if c > n - 1
+        c = n - 1
+    if c < 0
+        c = 0
+    mv_lines(l, c, WANT_KEEP)
+
+// motion_first_nonblank_down is `+`, `-` and `_`: whole lines, with the
+// cursor on the first non-blank character.
+pub fn motion_first_nonblank_down<V: TextView>(view: V, start: Pos, delta: Int) -> Mv
+    let last = view.last_line()
+    if delta > 0 and start.line >= last or delta < 0 and start.line <= 0
+        return mv_fail(start.line, start.col)
+    var l = start.line + delta
+    if l > last
+        l = last
+    if l < 0
+        l = 0
+    mv_lines(l, view.first_nonblank(l), WANT_FROM_COL)
+
+// motion_underscore is `_`: the line `count - 1` lines down.
+pub fn motion_underscore<V: TextView>(view: V, start: Pos, count: Int) -> Mv
+    let l = lines_down(view, start.line, count - 1)
+    if l < 0
+        return mv_fail(start.line, start.col)
+    mv_lines(l, view.first_nonblank(l), WANT_FROM_COL)
+
+// lines_down is the line `n` lines below `line`, or the last line when there
+// are fewer, as Vim's `cursor_down` goes.  It is -1 when `n` is above zero and
+// `line` is already the last.
+fn lines_down<V: TextView>(view: V, line: Int, n: Int) -> Int
+    let last = view.last_line()
+    if n <= 0
+        line
+    else if line >= last
+        0 - 1
+    else if line + n > last
+        last
+    else
+        line + n
+
+// ── Within a line ───────────────────────────────────────────────────
+
+// motion_zero is `0`.
+pub fn motion_zero(start: Pos) -> Mv
+    mv_at(start.line, 0)
+
+// motion_caret is `^`.
+pub fn motion_caret<V: TextView>(view: V, start: Pos) -> Mv
+    mv_at(start.line, view.first_nonblank(start.line))
+
+// motion_dollar is `$`: the end of the line `count - 1` lines down.  It
+// keeps the cursor at the end of its line while the cursor moves up and down.
+pub fn motion_dollar<V: TextView>(view: V, start: Pos, count: Int) -> Mv
+    let l = lines_down(view, start.line, count - 1)
+    if l < 0
+        return mv_fail(start.line, start.col)
+    let n = view.len_at(l)
+    Mv { ok: true, line: l, col: (if n > 0 then n - 1 else 0), linewise: false,
+         inclusive: true, jump: false, big: false, want: WANT_END }
+
+// motion_g_underscore is `g_`: the last non-blank character of the line
+// `count - 1` lines down.
+pub fn motion_g_underscore<V: TextView>(view: V, start: Pos, count: Int) -> Mv
+    let l = lines_down(view, start.line, count - 1)
+    if l < 0
+        return mv_fail(start.line, start.col)
+    mv_incl(l, view.last_nonblank(l))
+
+// motion_bar is `|`: column `count`, counted from one.
+pub fn motion_bar<V: TextView>(view: V, start: Pos, count: Int) -> Mv
+    let n = view.len_at(start.line)
+    var c = count - 1
+    if c > n - 1
+        c = n - 1
+    if c < 0
+        c = 0
+    let r = mv_at(start.line, c)
+    Mv { ok: true, line: r.line, col: r.col, linewise: false, inclusive: false,
+         jump: false, big: false, want: count - 1 }
+
+// ── Whole text ──────────────────────────────────────────────────────
+
+// motion_gg is `gg`, and `G` when `end` is set.  Without a count `gg` goes
+// to the first line and `G` to the last; with one, both go to that line.
+pub fn motion_gg<V: TextView>(view: V, has_count: Bool, count: Int, end: Bool) -> Mv
+    let last = view.last_line()
+    var l = if has_count
+        count - 1
+    else
+        if end
+            last
+        else
+            0
+    if l > last
+        l = last
+    Mv { ok: true, line: l, col: view.first_nonblank(l), linewise: true,
+         inclusive: false, jump: true, big: false, want: WANT_FROM_COL }
+
+// ── Find a character in the line ────────────────────────────────────
+
+// The find motion `f`: forward onto a character.
+pub const FIND_F = 1
+// The find motion `t`: forward to just before a character.
+pub const FIND_T = 2
+// The find motion `F`: backward onto a character.
+pub const FIND_BACK_F = 3
+// The find motion `T`: backward to just after a character.
+pub const FIND_BACK_T = 4
+
+// find_forward says whether a find motion goes toward the end of the line.
+pub fn find_forward(kind: Int) -> Bool
+    kind == FIND_F or kind == FIND_T
+
+// find_till says whether a find motion stops before the character.
+pub fn find_till(kind: Int) -> Bool
+    kind == FIND_T or kind == FIND_BACK_T
+
+// motion_find is `f`, `t`, `F` and `T`, and with `repeat` set `;` and `,`.  A
+// repeated till motion skips the character it is already next to when the
+// count is one.
+pub fn motion_find<V: TextView>(view: V, start: Pos, kind: Int, target: Int, count: Int,
+                                repeat: Bool) -> Mv
+    let n = view.len_at(start.line)
+    let fwd = find_forward(kind)
+    let dir = if fwd
+        1
+    else
+        0 - 1
+    var stop = true
+    if repeat and count == 1 and find_till(kind)
+        stop = false
+    var c = start.col
+    var left = count
+    while left > 0
+        left = left - 1
+        var found = false
+        while not found
+            c = c + dir
+            if c < 0 or c >= n
+                return mv_fail(start.line, start.col)
+            if view.char_at(start.line, c) == target and stop
+                found = true
+            else
+                stop = true
+    if find_till(kind)
+        c = c - dir
+    let r = mv_at(start.line, c)
+    Mv { ok: true, line: r.line, col: r.col, linewise: false, inclusive: fwd,
+         jump: false, big: false, want: WANT_FROM_COL }
+
+// ── Matching brackets ───────────────────────────────────────────────
+
+// bracket_partner is the bracket that pairs with one of `()[]{}`.
+fn bracket_partner(c: Int) -> Int
+    if c == '('
+        ')'
+    else if c == ')'
+        '('
+    else if c == '['
+        ']'
+    else if c == ']'
+        '['
+    else if c == '{'
+        '}'
+    else
+        '{'
+
+// is_opening says whether a bracket opens a pair.
+fn is_opening(c: Int) -> Bool
+    c == '(' or c == '[' or c == '{'
+
+// match_pair finds the bracket that pairs with the one at a place, or
+// answers a failure.  Brackets of the other kinds, and brackets in quotes,
+// are not treated specially.
+pub fn match_pair<V: TextView>(view: V, line: Int, col: Int, open: Int, close: Int,
+                               forward: Bool) -> Mv
+    var l = line
+    var c = col
+    var depth = 0
+    let last = view.last_line()
+    let same = if forward
+        open
+    else
+        close
+    let other = if forward
+        close
+    else
+        open
+    var res = mv_fail(line, col)
+    var going = true
+    while going
+        var moved = true
+        if forward
+            c = c + 1
+            while moved and c >= view.len_at(l)
+                if l >= last
+                    moved = false
+                else
+                    l = l + 1
+                    c = 0
+        else
+            c = c - 1
+            while moved and c < 0
+                if l <= 0
+                    moved = false
+                else
+                    l = l - 1
+                    c = view.len_at(l) - 1
+        if not moved
+            going = false
+        else
+            let x = view.char_at(l, c)
+            if x == same
+                depth = depth + 1
+            else if x == other
+                if depth == 0
+                    res = mv_incl(l, c)
+                    going = false
+                else
+                    depth = depth - 1
+    res
+
+// motion_percent is `%` without a count: from the cursor, or from the first
+// bracket after it in the line, to the matching bracket.  `<` and `>` are
+// not a pair.
+pub fn motion_percent<V: TextView>(view: V, start: Pos) -> Mv
+    let n = view.len_at(start.line)
+    var c = start.col
+    var found = 0
+    while c < n and found == 0
+        let x = view.char_at(start.line, c)
+        if x == '(' or x == ')' or x == '[' or x == ']' or x == '{' or x == '}'
+            found = x
+        else
+            c = c + 1
+    if found == 0
+        return mv_fail(start.line, start.col)
+    let r = if is_opening(found)
+        match_pair(view, start.line, c, found, bracket_partner(found), true)
+    else
+        match_pair(view, start.line, c, bracket_partner(found), found, false)
+    Mv { ok: r.ok, line: r.line, col: r.col, linewise: false, inclusive: true,
+         jump: true, big: true, want: WANT_FROM_COL }
+
+// motion_percent_count is `{count}%`: the line that far down the text, as a
+// percentage.
+pub fn motion_percent_count<V: TextView>(view: V, start: Pos, count: Int) -> Mv
+    if count > 100
+        return mv_fail(start.line, start.col)
+    let total = view.line_count()
+    let l = (count * total + 99) / 100 - 1
+    Mv { ok: true, line: l, col: view.first_nonblank(l), linewise: true,
+         inclusive: false, jump: true, big: false, want: WANT_FROM_COL }
+
+// ── Paragraphs ──────────────────────────────────────────────────────
+
+// motion_paragraph is `{` and `}`, as Vim's `findpar`: a paragraph ends at an
+// empty line.  Going forward past the last paragraph reaches the end of the
+// last line, inclusively.
+pub fn motion_paragraph<V: TextView>(view: V, start: Pos, count: Int, forward: Bool) -> Mv
+    let dir = if forward
+        1
+    else
+        0 - 1
+    let last = view.last_line()
+    var curr = start.line
+    var left = count
+    while left > 0
+        left = left - 1
+        var did_skip = false
+        var first = true
+        var stop = false
+        while not stop
+            if view.len_at(curr) > 0
+                did_skip = true
+            if not first and did_skip and view.len_at(curr) == 0
+                stop = true
+            else
+                curr = curr + dir
+                if curr < 0 or curr > last
+                    if left > 0
+                        return mv_fail(start.line, start.col)
+                    curr = curr - dir
+                    stop = true
+            first = false
+    if curr == last and forward
+        let n = view.len_at(curr)
+        if n > 0
+            return Mv { ok: true, line: curr, col: n - 1, linewise: false,
+                        inclusive: true, jump: true, big: true,
+                        want: WANT_FROM_COL }
+    Mv { ok: true, line: curr, col: 0, linewise: false, inclusive: false,
+         jump: true, big: true, want: WANT_FROM_COL }
+
+// ── Sentences ───────────────────────────────────────────────────────
+
+// incl_pos steps forward the way Vim's `incl` does, never stopping on the
+// place after the last character of a line.
+fn incl_pos<V: TextView>(view: V, line: Int, col: Int) -> Inc
+    let s = inc_pos(view, line, col)
+    if s.r >= 1 and s.col > 0
+        inc_pos(view, s.line, s.col)
+    else
+        s
+
+// decl_pos steps back the way Vim's `decl` does.
+fn decl_pos<V: TextView>(view: V, line: Int, col: Int) -> Inc
+    let s = dec_pos(view, line, col)
+    if s.r == 1 and s.col > 0
+        dec_pos(view, s.line, s.col)
+    else
+        s
+
+// step_sentence is the step `findsent` takes: `incl` going forward and
+// `decl` going back.
+fn step_sentence<V: TextView>(view: V, line: Int, col: Int, forward: Bool) -> Inc
+    if forward
+        incl_pos(view, line, col)
+    else
+        decl_pos(view, line, col)
+
+// is_end_mark says whether a codepoint may follow the end of a sentence
+// before the blanks: a closing bracket or a quote.
+fn is_closer(c: Int) -> Bool
+    c == ')' or c == ']' or c == '"' or c == '\''
+
+// is_stop says whether a codepoint ends a sentence or may follow its end.
+fn is_stop(c: Int) -> Bool
+    c == '.' or c == '!' or c == '?' or is_closer(c)
+
+// motion_sentence is `(` and `)`.  The motion ends on a character: one that
+// would be after the end of a line is moved back onto the line, and the
+// motion is then inclusive.
+pub fn motion_sentence<V: TextView>(view: V, start: Pos, count: Int, forward: Bool) -> Mv
+    let r = find_sentence(view, start, count, forward)
+    if not r.ok
+        return r
+    var inclusive = false
+    var c = r.col
+    if c > 0 and c >= view.len_at(r.line)
+        c = c - 1
+        inclusive = true
+    Mv { ok: true, line: r.line, col: c, linewise: false, inclusive: inclusive,
+         jump: true, big: true, want: WANT_FROM_COL }
+
+// find_sentence is Vim's `findsent`: the start of the `count`th sentence
+// after or before a place.  A sentence ends at a `.`, `!` or `?` followed by
+// closing brackets or quotes and then the end of a line, a space or a tab,
+// and an empty line is a sentence of its own.  The place may be the end of
+// the text, after the last character.
+pub fn find_sentence<V: TextView>(view: V, start: Pos, count: Int, forward: Bool) -> Mv
+    var l = start.line
+    var c = start.col
+    var left = count
+    var noskip = false
+    while left > 0
+        left = left - 1
+        var found = false
+        if view.ch(l, c) == NO_CHAR
+            var moving = true
+            while moving
+                let s = step_sentence(view, l, c, forward)
+                if s.r == 0 - 1
+                    moving = false
+                else
+                    l = s.line
+                    c = s.col
+                    if view.ch(l, c) != NO_CHAR
+                        moving = false
+            if forward
+                found = true
+        else if not forward
+            let d = decl_pos(view, l, c)
+            l = d.line
+            c = d.col
+        if not found
+            var found_dot = false
+            var scanning = true
+            while scanning
+                let ch = view.ch(l, c)
+                if vimtext.is_blank(ch) or ch != NO_CHAR and is_stop(ch)
+                    let t = decl_pos(view, l, c)
+                    if t.r == 0 - 1 or view.len_at(t.line) == 0 and forward
+                        scanning = false
+                    else if found_dot
+                        scanning = false
+                    else
+                        if ch == '.' or ch == '!' or ch == '?'
+                            found_dot = true
+                        let tc = view.ch(t.line, t.col)
+                        if is_closer(ch) and (tc == NO_CHAR or not is_stop(tc))
+                            scanning = false
+                        else
+                            let d2 = decl_pos(view, l, c)
+                            l = d2.line
+                            c = d2.col
+                else
+                    scanning = false
+            let startl = l
+            var ending = true
+            while ending
+                let ch = view.ch(l, c)
+                if ch == NO_CHAR
+                    if not forward and l != startl
+                        l = l + 1
+                    ending = false
+                else
+                    var stop_here = false
+                    if ch == '.' or ch == '!' or ch == '?'
+                        var tl = l
+                        var tc = c
+                        var cc = 0
+                        var looping = true
+                        while looping
+                            let s = inc_pos(view, tl, tc)
+                            tl = s.line
+                            tc = s.col
+                            cc = view.ch(tl, tc)
+                            if not is_closer(cc)
+                                looping = false
+                        if cc == ' ' or cc == '\t' or cc == NO_CHAR
+                            l = tl
+                            c = tc
+                            if view.ch(l, c) == NO_CHAR
+                                let n = inc_pos(view, l, c)
+                                l = n.line
+                                c = n.col
+                            stop_here = true
+                    if stop_here
+                        ending = false
+                    else
+                        let s = step_sentence(view, l, c, forward)
+                        l = s.line
+                        c = s.col
+                        if s.r == 0 - 1
+                            if left > 0
+                                return mv_fail(start.line, start.col)
+                            noskip = true
+                            ending = false
+        var skipping = not noskip
+        while skipping
+            let ch = view.ch(l, c)
+            if ch == ' ' or ch == '\t'
+                let s = incl_pos(view, l, c)
+                l = s.line
+                c = s.col
+                if s.r == 0 - 1
+                    skipping = false
+            else
+                skipping = false
+    mv_at(l, c)
+
+// find_first_blank moves back over the blanks before a place, as Vim's
+// `find_first_blank`, and answers the first of them.
+pub fn find_first_blank<V: TextView>(view: V, p: Pos) -> Pos
+    var l = p.line
+    var c = p.col
+    var moving = true
+    while moving
+        let s = decl_pos(view, l, c)
+        l = s.line
+        c = s.col
+        if s.r == 0 - 1
+            moving = false
+        else if not vimtext.is_blank(view.ch(l, c))
+            let n = incl_pos(view, l, c)
+            l = n.line
+            c = n.col
+            moving = false
+    vimtext.pos_new(l, c)
+
+// sentences_forward is Vim's `findsent_forward`: from the start of a
+// sentence, go `count` steps forward, where a step is a sentence or the blanks
+// after one.
+fn sentences_forward<V: TextView>(view: V, start: Pos, count_in: Int, at_start_in: Bool) -> Pos
+    var p = start
+    var count = count_in
+    var at_start = at_start_in
+    while count > 0
+        count = count - 1
+        let r = find_sentence(view, p, 1, true)
+        p = vimtext.pos_new(r.line, r.col)
+        if at_start
+            p = find_first_blank(view, p)
+        if count == 0 or at_start
+            let d = decl_pos(view, p.line, p.col)
+            p = vimtext.pos_new(d.line, d.col)
+        at_start = not at_start
+    p
+
+// SentenceObj is a sentence object found by `obj_sentence`.
+pub @value
+struct SentenceObj
+    ok: Bool
+    sl: Int
+    sc: Int
+    el: Int
+    ec: Int
+    inclusive: Bool
+    vl: Int
+    vc: Int
+
+// obj_sentence is `is` and `as`: Vim's `current_sent`.
+pub fn obj_sentence<V: TextView>(view: V, cur: Pos, count: Int, include: Bool) -> SentenceObj
+    var start = cur
+    var pos = cur
+    let next = find_sentence(view, cur, 1, true)
+    var end = vimtext.pos_new(next.line, next.col)
+    while vimtext.is_blank(view.ch(pos.line, pos.col))
+        let s = incl_pos(view, pos.line, pos.col)
+        pos = vimtext.pos_new(s.line, s.col)
+    var start_blank = false
+    if pos.line == end.line and pos.col == end.col
+        start_blank = true
+        start = find_first_blank(view, start)
+    else
+        let b = find_sentence(view, end, 1, false)
+        end = vimtext.pos_new(b.line, b.col)
+        start = end
+    var ncount = count
+    if include
+        ncount = count * 2
+    else if start_blank
+        ncount = ncount - 1
+    if ncount > 0
+        end = sentences_forward(view, end, ncount, true)
+    else
+        let d = decl_pos(view, end.line, end.col)
+        end = vimtext.pos_new(d.line, d.col)
+    if include
+        if start_blank
+            end = find_first_blank(view, end)
+            if vimtext.is_blank(view.ch(end.line, end.col))
+                let d = decl_pos(view, end.line, end.col)
+                end = vimtext.pos_new(d.line, d.col)
+        else if not vimtext.is_blank(view.ch(end.line, end.col))
+            start = find_first_blank(view, start)
+    let vend = end
+    let i = incl_pos(view, end.line, end.col)
+    end = vimtext.pos_new(i.line, i.col)
+    SentenceObj { ok: true, sl: start.line, sc: start.col, el: end.line,
+                  ec: end.col, inclusive: i.r == 0 - 1, vl: vend.line,
+                  vc: vend.col }
+
+// ── The window ──────────────────────────────────────────────────────
+
+// motion_window is `H`, `M` and `L`: a line of the window, with the cursor on
+// its first non-blank character.  `H` and `L` take a count that moves the
+// line inward.
+pub fn motion_window<V: TextView>(view: V, key: Int, count: Int) -> Mv
+    let top = view.top_line()
+    let h = view.height()
+    let last = view.last_line()
+    var bottom = top + h - 1
+    if bottom > last
+        bottom = last
+    var l = top
+    if key == 'H'
+        l = top + count - 1
+        if l > bottom
+            l = bottom
+    else if key == 'L'
+        l = bottom - (count - 1)
+        if l < top
+            l = top
+    else
+        var shown = view.line_count() - top
+        if shown > h
+            shown = h
+        l = top + (shown + 1) / 2 - 1
+    Mv { ok: true, line: l, col: view.first_nonblank(l), linewise: true,
+         inclusive: false, jump: true, big: false, want: WANT_FROM_COL }

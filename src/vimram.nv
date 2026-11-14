@@ -1,0 +1,544 @@
+// vimram.nv — a text in memory that applies the actions of a step.
+//
+// A `Doc` keeps its lines as lists of codepoints.  It implements `TextView`,
+// so a step can read it, and `doc_apply` carries out each `Action` on it
+// the way the action's documentation says.  A program with no text store of
+// its own can use it as the text, and the tests of this package use it to
+// run keys against a text and compare the result.
+//
+// A `Doc` also keeps an undo stack of whole texts, which is the host's part
+// of `Undo` and `Redo`, the last search pattern, and the window: the first
+// line shown and the number of lines it holds.  Indents are tabs and spaces
+// with a tab stop of eight, and the shift width is `shiftwidth`.
+
+use std.list
+use vimtext
+use vimmodal
+use vimkey
+use vimscroll
+use vimstep
+
+// Doc is a text in memory.
+pub struct Doc
+    var lines: [[Int]]
+    var top: Int
+    var rows: Int
+    var shiftwidth: Int
+    var undo: [[[Int]]]
+    var redo: [[[Int]]]
+    var undo_at: [Int]
+    var redo_at: [Int]
+    var hint_line: Int
+    var hint_col: Int
+    var restore_line: Int
+    var restore_col: Int
+    var last_pattern: [Int]
+    var last_whole: Bool
+    var bells: Int
+
+impl TextView for Doc
+    fn line_count(self) -> Int
+        list.len(self.lines)
+
+    fn line_len(self, line: Int) -> Int
+        list.len(self.lines[line])
+
+    fn char_at(self, line: Int, col: Int) -> Int
+        self.lines[line][col]
+
+    fn top_line(self) -> Int
+        self.top
+
+    fn height(self) -> Int
+        self.rows
+
+// doc_new is a text with the lines given, shown in a window of `rows`
+// lines.  A text with no lines has one empty line.
+pub fn doc_new(text: [Str], rows: Int) -> Doc
+    var lines: [[Int]] = []
+    for s in text
+        list.push(lines, vimtext.decode_utf8(s))
+    if list.len(lines) == 0
+        list.push(lines, [])
+    Doc { lines: lines, top: 0, rows: rows, shiftwidth: 8, undo: [], redo: [],
+          undo_at: [], redo_at: [], hint_line: 0, hint_col: 0,
+          restore_line: 0, restore_col: 0,
+          last_pattern: [], last_whole: false, bells: 0 }
+
+// doc_lines is the lines of a text, as strings.
+pub fn doc_lines(d: Doc) -> [Str]
+    var out: [Str] = []
+    for l in d.lines
+        list.push(out, vimtext.encode_utf8(l))
+    out
+
+// snapshot copies the lines of a text.
+fn snapshot(d: Doc) -> [[Int]]
+    var out: [[Int]] = []
+    for l in d.lines
+        list.push(out, list.clone(l))
+    out
+
+// copy_lines copies a snapshot.
+fn copy_lines(xs: [[Int]]) -> [[Int]]
+    var out: [[Int]] = []
+    for l in xs
+        list.push(out, list.clone(l))
+    out
+
+// set_line replaces a line.
+fn set_line(var d: Doc, line: Int, cps: [Int])
+    d.lines[line] = list.clone(cps)
+
+// splice_lines replaces the lines `first` to `last` inclusive with new ones.
+fn splice_lines(var d: Doc, first: Int, last: Int, repl: [[Int]])
+    var out: [[Int]] = []
+    let n = list.len(d.lines)
+    for i in 0..(if first < n then first else n)
+        list.push(out, d.lines[i])
+    for r in repl
+        list.push(out, list.clone(r))
+    for i in last + 1..n
+        list.push(out, d.lines[i])
+    if list.len(out) == 0
+        list.push(out, [])
+    d.lines = out
+
+// split_lines breaks codepoints at newlines.
+fn split_lines(cps: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    var cur: [Int] = []
+    for c in cps
+        if c == '\n'
+            list.push(out, cur)
+            cur = []
+        else
+            list.push(cur, c)
+    list.push(out, cur)
+    out
+
+// insert_at puts text at a place.
+fn insert_at(var d: Doc, line: Int, col: Int, text: [Int])
+    let segs = split_lines(text)
+    let cur = d.lines[line]
+    let head = cur[0:col]
+    let tail = cur[col:]
+    let k = list.len(segs)
+    if k == 1
+        set_line(var d, line, [...head, ...segs[0], ...tail])
+    else
+        var repl: [[Int]] = []
+        list.push(repl, [...head, ...segs[0]])
+        for i in 1..k - 1
+            list.push(repl, list.clone(segs[i]))
+        list.push(repl, [...segs[k - 1], ...tail])
+        splice_lines(var d, line, line, repl)
+
+// delete_span removes a span.
+fn delete_span(var d: Doc, s: Span)
+    if s.linewise
+        splice_lines(var d, s.line, s.end_line, [])
+    else
+        let head = d.lines[s.line][0:s.col]
+        let tail = d.lines[s.end_line][s.end_col:]
+        splice_lines(var d, s.line, s.end_line, [[...head, ...tail]])
+
+// indent_width is the width in columns of the blanks that begin a line.
+fn indent_width(cps: [Int]) -> Int
+    var w = 0
+    for c in cps
+        if c == ' '
+            w = w + 1
+        else if c == '\t'
+            w = w + 8 - w % 8
+        else
+            break
+    w
+
+// indent_end is the number of characters in the blanks that begin a line.
+fn indent_end(cps: [Int]) -> Int
+    var i = 0
+    while i < list.len(cps) and vimtext.is_blank(cps[i])
+        i = i + 1
+    i
+
+// indent_text is blanks of a given width, as tabs and then spaces.
+fn indent_text(w: Int) -> [Int]
+    var out: [Int] = []
+    var i = 0
+    while i < w / 8
+        list.push(out, '\t')
+        i = i + 1
+    i = 0
+    while i < w % 8
+        list.push(out, ' ')
+        i = i + 1
+    out
+
+// shift_lines shifts lines by `levels` shift widths, right or left.
+fn shift_lines(var d: Doc, first: Int, last: Int, levels: Int, right: Bool)
+    var l = first
+    while l <= last and l < list.len(d.lines)
+        let cps = d.lines[l]
+        if list.len(cps) > 0
+            let w = indent_width(cps)
+            var nw = w + d.shiftwidth * levels
+            if not right
+                nw = w - d.shiftwidth * levels
+                if nw < 0
+                    nw = 0
+            set_line(var d, l, [...indent_text(nw), ...cps[indent_end(cps):]])
+        l = l + 1
+
+// lower is the lower case of a codepoint.
+fn lower(c: Int) -> Int
+    if c >= 'A' and c <= 'Z' or c >= 0xC0 and c <= 0xDE and c != 0xD7
+        c + 32
+    else if c >= 0x391 and c <= 0x3A9
+        c + 32
+    else if c >= 0x410 and c <= 0x42F
+        c + 32
+    else
+        c
+
+// upper is the upper case of a codepoint.
+fn upper(c: Int) -> Int
+    if c >= 'a' and c <= 'z' or c >= 0xE0 and c <= 0xFE and c != 0xF7
+        c - 32
+    else if c >= 0x3B1 and c <= 0x3C9 and c != 0x3C2
+        c - 32
+    else if c >= 0x430 and c <= 0x44F
+        c - 32
+    else
+        c
+
+// change_case changes the case of a codepoint.
+fn change_case(c: Int, kind: Int) -> Int
+    if kind == CASE_LOWER
+        lower(c)
+    else if kind == CASE_UPPER
+        upper(c)
+    else if lower(c) != c
+        lower(c)
+    else
+        upper(c)
+
+// case_span changes the case of the characters in a span.
+fn case_span(var d: Doc, s: Span, kind: Int)
+    for l in s.line..=s.end_line
+        var from = 0
+        var to = list.len(d.lines[l])
+        if not s.linewise
+            if l == s.line
+                from = s.col
+            if l == s.end_line
+                to = s.end_col
+        for c in from..to
+            d.lines[l][c] = change_case(d.lines[l][c], kind)
+
+// join_at joins `count` lines from `line`, with the rules of `J` and `gJ`.
+fn join_at(var d: Doc, line: Int, count: Int, spaces: Bool)
+    var cur: [Int] = list.clone(d.lines[line])
+    var prev_last = 0
+    if list.len(cur) > 0
+        prev_last = cur[list.len(cur) - 1]
+    var k = 1
+    while k < count and line + k < list.len(d.lines)
+        var piece: [Int] = list.clone(d.lines[line + k])
+        if spaces
+            piece = piece[indent_end(piece):]
+        var sp: [Int] = []
+        if spaces and list.len(piece) > 0 and list.len(cur) > 0 and piece[0] != ')' and prev_last != '\t' and prev_last != ' '
+            sp = [' ']
+        cur = [...cur, ...sp, ...piece]
+        prev_last = 0
+        if list.len(piece) > 0
+            prev_last = piece[list.len(piece) - 1]
+        k = k + 1
+    splice_lines(var d, line, line + k - 1, [cur])
+
+// first_diff is the first line at which two texts differ.
+fn first_diff(a: [[Int]], b: [[Int]]) -> Int
+    var i = 0
+    while i < list.len(a) and i < list.len(b) and a[i] == b[i]
+        i = i + 1
+    if i >= list.len(b)
+        i = list.len(b) - 1
+    i
+
+// doc_apply carries out one action on the text.  The actions that only
+// concern the screen, the cursor, the mode or the command line change
+// nothing in the text.
+pub fn doc_apply(var d: Doc, a: Action)
+    match a
+        Delete(s)                              =>
+            delete_span(var d, s)
+        Insert(line, col, text)                =>
+            insert_at(var d, line, col, vimtext.decode_utf8(text))
+        ReplaceChar(line, col, count, c)       =>
+            for i in 0..count
+                d.lines[line][col + i] = c
+        JoinLines(line, count, spaces)         =>
+            join_at(var d, line, count, spaces)
+        Indent(first, last, levels)            =>
+            shift_lines(var d, first, last, levels, true)
+        Dedent(first, last, levels)            =>
+            shift_lines(var d, first, last, levels, false)
+        ChangeCase(s, kind)                    =>
+            case_span(var d, s, kind)
+        Put(line, col, text, linewise)         =>
+            if linewise
+                let at = if line > list.len(d.lines)
+                    list.len(d.lines)
+                else
+                    line
+                var repl: [[Int]] = split_lines(vimtext.decode_utf8(text))
+                var out: [[Int]] = []
+                for i in 0..at
+                    list.push(out, d.lines[i])
+                for r in repl
+                    list.push(out, list.clone(r))
+                for i in at..list.len(d.lines)
+                    list.push(out, d.lines[i])
+                d.lines = out
+            else
+                insert_at(var d, line, col, vimtext.decode_utf8(text))
+        UndoMark(line, col)                    =>
+            list.push(d.undo, snapshot(d))
+            list.push(d.undo_at, line)
+            list.push(d.undo_at, col)
+            d.redo = []
+            d.redo_at = []
+        ScrollBy(n)                            =>
+            var t = d.top + n
+            if t > list.len(d.lines) - 1
+                t = list.len(d.lines) - 1
+            if t < 0
+                t = 0
+            d.top = t
+        ScrollPage(direction, pages)           =>
+            d.top = vimscroll.page_top(d.top, d.rows, list.len(d.lines), direction == SCROLL_PAGE_DOWN, pages)
+        Bell                                   =>
+            d.bells = d.bells + 1
+        MoveCursor(line, col)                  =>
+            return
+        Yank(s)                                =>
+            return
+        Undo                                   =>
+            return
+        Redo                                   =>
+            return
+        SetMode(mode)                          =>
+            return
+        Search(forward, pattern, whole, count) =>
+            return
+        EnterCommandLine(kind, initial)        =>
+            return
+
+// undo_doc takes back the last change, and answers the line it changed.
+// The cursor the change was made from is left in `restore_line` and
+// `restore_col`.
+fn undo_doc(var d: Doc) -> Int
+    let n = list.len(d.undo)
+    if n == 0
+        return 0 - 1
+    let prev = d.undo[n - 1]
+    d.restore_line = d.undo_at[2 * n - 2]
+    d.restore_col = d.undo_at[2 * n - 1]
+    d.undo = d.undo[0:n - 1]
+    d.undo_at = d.undo_at[0:2 * n - 2]
+    list.push(d.redo, snapshot(d))
+    list.push(d.redo_at, d.hint_line)
+    list.push(d.redo_at, d.hint_col)
+    let at = first_diff(d.lines, prev)
+    d.lines = copy_lines(prev)
+    at
+
+// redo_doc puts back the last change that was taken back.
+fn redo_doc(var d: Doc) -> Int
+    let n = list.len(d.redo)
+    if n == 0
+        return 0 - 1
+    let next = d.redo[n - 1]
+    d.restore_line = d.redo_at[2 * n - 2]
+    d.restore_col = d.redo_at[2 * n - 1]
+    d.redo = d.redo[0:n - 1]
+    d.redo_at = d.redo_at[0:2 * n - 2]
+    list.push(d.undo, snapshot(d))
+    list.push(d.undo_at, d.hint_line)
+    list.push(d.undo_at, d.hint_col)
+    let at = first_diff(d.lines, next)
+    d.lines = copy_lines(next)
+    at
+
+// place_after_undo puts the cursor where an undo or a redo leaves it: where
+// the change was made from when that line is the one that changed, and on
+// the first non-blank character of the changed line otherwise.
+fn place_after_undo(d: Doc, m: Modal, at: Int) -> Modal
+    if at == d.restore_line
+        vimstep.set_cursor(m, d, at, d.restore_col)
+    else
+        var n = vimstep.set_cursor(m, d, at, 0)
+        n.nonblank = true
+        vimstep.settle(n, d)
+
+// is_word_at says whether the character at a place is a keyword character.
+fn is_word_at(d: Doc, line: Int, col: Int) -> Bool
+    col >= 0 and col < list.len(d.lines[line]) and vimtext.is_word_char(d.lines[line][col])
+
+// matches_at says whether the pattern is in the text at a place.
+fn matches_at(d: Doc, line: Int, col: Int, pat: [Int], whole: Bool) -> Bool
+    let cur = d.lines[line]
+    let n = list.len(pat)
+    if n == 0 or col + n > list.len(cur)
+        return false
+    var i = 0
+    while i < n
+        if cur[col + i] != pat[i]
+            return false
+        i = i + 1
+    if whole
+        if is_word_at(d, line, col - 1) or is_word_at(d, line, col + n)
+            return false
+    true
+
+// SearchHit is where a search ended.
+pub @value
+struct SearchHit
+    found: Bool
+    line: Int
+    col: Int
+
+// doc_search finds the `count`th match of a pattern from a place, wrapping
+// around the text.  An empty pattern is the last pattern searched for.
+pub fn doc_search(var d: Doc, line: Int, col: Int, forward: Bool, pattern: Str, whole: Bool,
+                  count: Int) -> SearchHit
+    var pat = vimtext.decode_utf8(pattern)
+    var w = whole
+    if list.len(pat) == 0
+        pat = d.last_pattern
+        w = d.last_whole
+    else
+        d.last_pattern = pat
+        d.last_whole = whole
+    var l = line
+    var c = col
+    var left = count
+    let total = list.len(d.lines)
+    while left > 0
+        left = left - 1
+        var found = false
+        var tries = 0
+        var maxtries = 0
+        for row in d.lines
+            maxtries = maxtries + list.len(row) + 1
+        while not found and tries <= maxtries
+            tries = tries + 1
+            if forward
+                c = c + 1
+                if c >= list.len(d.lines[l]) + 1
+                    l = (l + 1) % total
+                    c = 0
+            else
+                c = c - 1
+                if c < 0
+                    l = (l + total - 1) % total
+                    c = list.len(d.lines[l])
+            if matches_at(d, l, c, pat, w)
+                found = true
+        if not found
+            return SearchHit { found: false, line: 0, col: 0 }
+    SearchHit { found: true, line: l, col: c }
+
+// Harness is a text, a state and the keys not yet typed.
+pub struct Harness
+    var doc: Doc
+    var modal: Modal
+
+// has_cmdline says whether a step asked for a command line.
+fn cmdline_kind_of(acts: [Action]) -> Int
+    for a in acts
+        match a
+            EnterCommandLine(k, initial) =>
+                return k
+            _                            =>
+                continue
+    0 - 1
+
+// apply_actions applies the actions of a step to a text, and answers the
+// state with its cursor placed after an undo or a redo.  A search action is
+// answered at once, and what the answer asks is applied in turn.  An action
+// that asks for a command line is not answered; the host reads the line.
+pub fn apply_actions(var d: Doc, m0: Modal, acts: [Action]) -> Modal
+    var m = m0
+    for a in acts
+        match a
+            Undo                                   =>
+                let at = undo_doc(var d)
+                if at >= 0
+                    m = place_after_undo(d, m, at)
+            Redo                                   =>
+                let at = redo_doc(var d)
+                if at >= 0
+                    m = place_after_undo(d, m, at)
+            Search(forward, pattern, whole, count) =>
+                let hit = doc_search(var d, m.line, m.col, forward, pattern, whole, count)
+                let answer = if hit.found
+                    vimstep.search_found(m, d, hit.line, hit.col)
+                else
+                    vimstep.search_failed(m, d)
+                m = apply_actions(var d, answer.modal, answer.actions)
+            _                                      =>
+                doc_apply(var d, a)
+    m
+
+// has_bell says whether a step refused its key.
+fn has_bell(acts: [Action]) -> Bool
+    for a in acts
+        match a
+            Bell =>
+                return true
+            _    =>
+                continue
+    false
+
+// run types keys, written as text, against a text.  Each key is a step, its
+// actions are applied, and the cursor is settled on the changed text.  A
+// command line is read from the keys that follow it, up to Enter.  A key
+// that is refused discards the keys after it, as an editor discards what
+// was typed ahead after an error.
+pub fn run(var d: Doc, m0: Modal, keys: Str) -> Modal
+    var m = m0
+    var rest = vimkey.codes_of(keys)
+    while list.len(rest) > 0
+        d.hint_line = m.line
+        d.hint_col = m.col
+        let s = vimstep.step_code(m, d, rest[0])
+        rest = rest[1:]
+        m = s.modal
+        m = apply_actions(var d, m, s.actions)
+        if has_bell(s.actions)
+            rest = []
+        let kind = cmdline_kind_of(s.actions)
+        if kind >= 0
+            var text: [Int] = []
+            var aborted = false
+            var reading = true
+            while reading and list.len(rest) > 0
+                let c = rest[0]
+                rest = rest[1:]
+                if c == K_ENTER
+                    reading = false
+                else if c == K_ESC
+                    aborted = true
+                    reading = false
+                else
+                    list.push(text, c)
+            if aborted
+                m = vimstep.cmdline_abort(m).modal
+            else
+                let done = vimstep.cmdline_done(m, d, vimtext.encode_utf8(text))
+                m = done.modal
+                m = apply_actions(var d, m, done.actions)
+        m = vimstep.settle(m, d)
+    m

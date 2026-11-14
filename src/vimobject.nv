@@ -1,0 +1,476 @@
+// vimobject.nv — the text objects: a word, a paragraph, a bracketed block or
+// a quoted string, found around the cursor.
+//
+// An object answers an `Obj`: where it starts, where it ends, and whether
+// the end is part of it.  The algorithms are those of Vim's
+// `textobject.c`, and each function names the Vim function it follows.
+//
+// In Visual mode an object is taken from the cursor and the Visual anchor.
+// When the selection is one character the object is selected; otherwise the
+// selection is extended by the object, forward or backward.  `vl` and `vc`
+// are the cursor an object leaves in Visual mode and `sl` and `sc` the
+// anchor.
+
+use vimtext
+use vimmotion
+
+// Obj is a text object.  `inclusive` says whether the character at the end
+// place belongs to it.  A linewise object is whole lines from `sl` to `el`.
+pub @value
+struct Obj
+    ok: Bool
+    sl: Int
+    sc: Int
+    el: Int
+    ec: Int
+    linewise: Bool
+    inclusive: Bool
+    vl: Int
+    vc: Int
+
+// obj_fail is an object that was not found.
+pub fn obj_fail() -> Obj
+    Obj { ok: false, sl: 0, sc: 0, el: 0 - 1, ec: 0 - 1, linewise: false,
+          inclusive: false, vl: 0, vc: 0 }
+
+// obj_fail_at is an object that was not found after the search had moved
+// to a place.  A word object leaves the cursor there, as Vim does.
+fn obj_fail_at(line: Int, col: Int) -> Obj
+    Obj { ok: false, sl: 0, sc: 0, el: line, ec: col, linewise: false,
+          inclusive: false, vl: 0, vc: 0 }
+
+// incl steps forward one character the way Vim's `incl` does: it never
+// stops on the place after the last character of a line.
+fn incl<V: TextView>(view: V, line: Int, col: Int) -> Inc
+    let s = vimmotion.inc_pos(view, line, col)
+    if s.r >= 1 and s.col > 0
+        vimmotion.inc_pos(view, s.line, s.col)
+    else
+        s
+
+// decl steps back one character the way Vim's `decl` does.
+fn decl<V: TextView>(view: V, line: Int, col: Int) -> Inc
+    let s = vimmotion.dec_pos(view, line, col)
+    if s.r == 1 and s.col > 0
+        vimmotion.dec_pos(view, s.line, s.col)
+    else
+        s
+
+// in_indent says whether the cursor is on a blank before the first
+// character that is not a blank, with `extra` characters of slack: Vim's
+// `inindent`.
+fn in_indent<V: TextView>(view: V, line: Int, col: Int, extra: Int) -> Bool
+    var w = 0
+    let n = view.len_at(line)
+    while w < n and vimtext.is_blank(view.char_at(line, w))
+        w = w + 1
+    w >= col + extra
+
+// back_in_line moves to the start of the run of characters of the same class
+// within the line, as Vim's `back_in_line`.
+fn back_in_line<V: TextView>(view: V, line: Int, col: Int, big: Bool) -> Int
+    let sclass = view.cls_at(line, col, big)
+    var c = col
+    while c > 0
+        c = c - 1
+        if view.cls_at(line, c, big) != sclass
+            c = c + 1
+            break
+    c
+
+// word_obj builds a word object from its two ends.
+fn word_obj(sl: Int, sc: Int, l: Int, c: Int, inclusive: Bool) -> Obj
+    Obj { ok: true, sl: sl, sc: sc, el: l, ec: c, linewise: false,
+          inclusive: inclusive, vl: l, vc: c }
+
+// obj_word is `iw`, `aw`, `iW` and `aW`: Vim's `current_word`.  `vis` says
+// that Visual mode is active with its anchor at `anchor`.
+pub fn obj_word<V: TextView>(view: V, cur: Pos, anchor: Pos, vis: Bool, count_in: Int,
+                             include: Bool, big: Bool) -> Obj
+    var count = count_in
+    var l = cur.line
+    var c = cur.col
+    var sl = anchor.line
+    var sc = anchor.col
+    var inclusive = true
+    var include_white = false
+    let single = not vis or cur.line == anchor.line and cur.col == anchor.col
+    if single
+        c = back_in_line(view, l, c, big)
+        sl = l
+        sc = c
+        if (view.cls_at(l, c, big) == CLASS_BLANK) == include
+            let r = vimmotion.end_word(view, vimtext.pos_new(l, c), 1, big, true, true)
+            l = r.line
+            c = r.col
+            if not r.ok
+                return obj_fail_at(l, c)
+        else
+            let r = vimmotion.fwd_word(view, vimtext.pos_new(l, c), 1, big, true)
+            l = r.line
+            c = r.col
+            if c == 0
+                let d = decl(view, l, c)
+                l = d.line
+                c = d.col
+            else
+                c = c - 1
+            if include
+                include_white = true
+        count = count - 1
+    while count > 0
+        inclusive = true
+        if vis and vimtext.pos_before(vimtext.pos_new(l, c), vimtext.pos_new(sl, sc))
+            let d = decl(view, l, c)
+            l = d.line
+            c = d.col
+            if d.r == 0 - 1
+                return obj_fail_at(l, c)
+            if include != (view.cls_at(l, c, big) != CLASS_BLANK)
+                let r = vimmotion.bck_word(view, vimtext.pos_new(l, c), 1, big, true)
+                l = r.line
+                c = r.col
+                if not r.ok
+                    return obj_fail_at(l, c)
+            else
+                let r = vimmotion.bckend_word(view, vimtext.pos_new(l, c), 1, big, true)
+                l = r.line
+                c = r.col
+                if not r.ok
+                    return obj_fail_at(l, c)
+                let s = incl(view, l, c)
+                l = s.line
+                c = s.col
+        else
+            let s = incl(view, l, c)
+            l = s.line
+            c = s.col
+            if s.r == 0 - 1
+                return obj_fail_at(l, c)
+            let to_word_end = include == (view.cls_at(l, c, big) == CLASS_BLANK)
+            let r = if to_word_end
+                vimmotion.end_word(view, vimtext.pos_new(l, c), 1, big, true, true)
+            else
+                vimmotion.fwd_word(view, vimtext.pos_new(l, c), 1, big, true)
+            l = r.line
+            c = r.col
+            if not r.ok and (to_word_end or count > 1)
+                return obj_fail_at(l, c)
+            if not to_word_end
+                if c == 0
+                    inclusive = false
+                else
+                    c = c - 1
+        count = count - 1
+    if include_white and (view.cls_at(l, c, big) != CLASS_BLANK or c == 0 and not inclusive)
+        if sc > 0
+            let p = back_in_line(view, sl, sc - 1, big)
+            if view.cls_at(sl, p, big) == CLASS_BLANK and p > 0
+                sc = p
+    word_obj(sl, sc, l, c, inclusive)
+
+// line_white says whether a line is empty or all blanks.
+fn line_white<V: TextView>(view: V, line: Int) -> Bool
+    view.first_nonblank_raw(line) >= view.len_at(line)
+
+// par_obj builds a paragraph object from its first and last lines.
+fn par_obj(first: Int, last: Int) -> Obj
+    Obj { ok: true, sl: first, sc: 0, el: last, ec: 0, linewise: true,
+          inclusive: false, vl: last, vc: 0 }
+
+// extend_paragraph is the part of Vim's `current_par` that grows a Visual
+// selection of several lines by `count` paragraphs.
+fn extend_paragraph<V: TextView>(view: V, start_in: Int, anchor_line: Int, anchor_col: Int,
+                                 count: Int, include: Bool) -> Obj
+    let last = view.last_line()
+    var start = start_in
+    let dir = if start < anchor_line
+        0 - 1
+    else
+        1
+    var i = count
+    var ok = true
+    while i > 0 and ok
+        i = i - 1
+        if start == (if dir < 0 then 0 else last)
+            ok = false
+        else
+            var t = 0
+            var more = true
+            while t < 2 and more
+                start = start + dir
+                let white = if line_white(view, start)
+                    1
+                else
+                    0
+                var walking = true
+                while walking
+                    if start == (if dir < 0 then 0 else last)
+                        walking = false
+                    else if white != (if line_white(view, start + dir) then 1 else 0)
+                        walking = false
+                    else
+                        start = start + dir
+                if not include or start == (if dir < 0 then 0 else last)
+                    more = false
+                t = t + 1
+    Obj { ok: ok, sl: anchor_line, sc: anchor_col, el: start, ec: 0,
+          linewise: false, inclusive: false, vl: start, vc: 0 }
+
+// obj_paragraph is `ip` and `ap`: Vim's `current_par`.  `line_mode` says that
+// the Visual mode is the linewise one.
+pub fn obj_paragraph<V: TextView>(view: V, cur: Pos, anchor: Pos, vis: Bool, line_mode: Bool,
+                                  count: Int, include: Bool) -> Obj
+    let last = view.last_line()
+    var start = cur.line
+    if vis and start != anchor.line
+        return extend_paragraph(view, start, anchor.line, anchor.col, count, include)
+    let white_in_front = line_white(view, start)
+    while start > 0
+        if white_in_front
+            if not line_white(view, start - 1)
+                break
+        else
+            if line_white(view, start - 1)
+                break
+        start = start - 1
+    if vis and line_mode and start == cur.line
+        return extend_paragraph(view, start, anchor.line, anchor.col, count, include)
+    var end = start
+    while end <= last and line_white(view, end)
+        end = end + 1
+    end = end - 1
+    var i = count
+    if not include and white_in_front
+        i = i - 1
+    var do_white = false
+    while i > 0
+        i = i - 1
+        if end == last
+            return obj_fail()
+        if not include
+            do_white = line_white(view, end + 1)
+        if include or not do_white
+            end = end + 1
+            while end < last and not line_white(view, end + 1)
+                end = end + 1
+        if i == 0 and white_in_front and include
+            break
+        if include or do_white
+            while end < last and line_white(view, end + 1)
+                end = end + 1
+    if not white_in_front and not line_white(view, end) and include
+        while start > 0 and line_white(view, start - 1)
+            start = start - 1
+    var o = par_obj(start, end)
+    if vis and anchor.line == start
+        o = Obj { ok: true, sl: start, sc: anchor.col, el: end, ec: 0,
+                  linewise: true, inclusive: false, vl: end, vc: 0 }
+    o
+
+// block_obj builds a block object.  `vl` and `vc` are the cursor in Visual
+// mode.
+fn block_obj(sl: Int, sc: Int, el: Int, ec: Int, inclusive: Bool, vl: Int, vc: Int) -> Obj
+    Obj { ok: true, sl: sl, sc: sc, el: el, ec: ec, linewise: false,
+          inclusive: inclusive, vl: vl, vc: vc }
+
+// find_enclosing is the opening bracket that encloses a place, searching
+// backward `count` times, each from the one before.
+fn find_enclosing<V: TextView>(view: V, line: Int, col: Int, count: Int, open: Int,
+                               close: Int) -> Mv
+    var l = line
+    var c = col
+    var i = 0
+    var last = vimmotion.mv_fail(line, col)
+    while i < count
+        i = i + 1
+        last = vimmotion.match_pair(view, l, c, open, close, false)
+        if not last.ok
+            return last
+        l = last.line
+        c = last.col
+    last
+
+// find_next_open is the opening bracket after a place, searching forward
+// `count` times, each from the one before.  A closing bracket met on the
+// way must be matched by an opening one first.
+fn find_next_open<V: TextView>(view: V, line: Int, col: Int, count: Int, open: Int,
+                               close: Int) -> Mv
+    var l = line
+    var c = col
+    var i = 0
+    var last = vimmotion.mv_fail(line, col)
+    while i < count
+        i = i + 1
+        last = vimmotion.match_pair(view, l, c, close, open, true)
+        if not last.ok
+            return last
+        l = last.line
+        c = last.col
+    last
+
+// obj_block is `i(`, `a(`, `ib`, `ab` and the same for `[`, `{` and `<`:
+// Vim's `current_block`.  The brackets inside quotes are not skipped.  When
+// the cursor is in no block, the first block after it is the object.
+pub fn obj_block<V: TextView>(view: V, cur: Pos, anchor: Pos, vis: Bool, count: Int, include: Bool,
+                              open: Int, close: Int) -> Obj
+    var l = cur.line
+    var c = cur.col
+    var old_start = vimtext.pos_new(l, c)
+    var old_end = vimtext.pos_new(l, c)
+    let single = not vis or cur.line == anchor.line and cur.col == anchor.col
+    if single
+        if open == '{'
+            while in_indent(view, l, c, 1)
+                let s = vimmotion.inc_pos(view, l, c)
+                l = s.line
+                c = s.col
+                if s.r != 0
+                    break
+        if view.ch(l, c) == open
+            c = c + 1
+    else if vimtext.pos_before(anchor, cur)
+        old_start = anchor
+        l = anchor.line
+        c = anchor.col
+    else
+        old_end = anchor
+    var st = find_enclosing(view, l, c, count, open, close)
+    if not st.ok
+        if find_enclosing(view, l, c, 1, open, close).ok
+            return obj_fail()
+        st = find_next_open(view, l, c, count, open, close)
+        if not st.ok
+            return obj_fail()
+    var sl = st.line
+    var sc = st.col
+    var e = vimmotion.match_pair(view, sl, sc, open, close, true)
+    if not e.ok
+        return obj_fail()
+    var el = e.line
+    var ec = e.col
+    var sol = false
+    var again = not include
+    while again
+        again = false
+        let s1 = incl(view, sl, sc)
+        sl = s1.line
+        sc = s1.col
+        sol = ec == 0
+        var d = decl(view, el, ec)
+        el = d.line
+        ec = d.col
+        while in_indent(view, el, ec, 1)
+            sol = true
+            d = decl(view, el, ec)
+            el = d.line
+            ec = d.col
+            if d.r != 0
+                break
+        let start_p = vimtext.pos_new(sl, sc)
+        let end_p = vimtext.pos_new(el, ec)
+        if vis and not vimtext.pos_before(start_p, old_start) and not vimtext.pos_before(old_end, end_p) and not (sl == el and sc == ec)
+            let d2 = decl(view, old_start.line, old_start.col)
+            let p = vimmotion.match_pair(view, d2.line, d2.col, open, close, false)
+            if not p.ok
+                return obj_fail()
+            sl = p.line
+            sc = p.col
+            let q = vimmotion.match_pair(view, sl, sc, open, close, true)
+            if not q.ok
+                return obj_fail()
+            el = q.line
+            ec = q.col
+            again = true
+    if vis
+        var vl = el
+        var vc = ec
+        if sol and view.ch(vl, vc) != NO_CHAR
+            vc = vc + 1
+        return block_obj(sl, sc, el, ec, true, vl, vc)
+    var inclusive = false
+    if not include and sol
+        let s2 = incl(view, el, ec)
+        el = s2.line
+        ec = s2.col
+    else if not vimtext.pos_before(vimtext.pos_new(el, ec), vimtext.pos_new(sl, sc))
+        inclusive = true
+    else
+        el = sl
+        ec = sc
+    block_obj(sl, sc, el, ec, inclusive, el, ec)
+
+// find_next_quote is the column of the next quote at or after `col`,
+// skipping a character that follows a backslash when `escape` is set, or -1.
+fn find_next_quote<V: TextView>(view: V, line: Int, col_in: Int, quote: Int, escape: Bool) -> Int
+    var col = col_in
+    let n = view.len_at(line)
+    while col < n
+        let c = view.char_at(line, col)
+        if escape and c == '\\'
+            col = col + 1
+            if col >= n
+                return 0 - 1
+        else if c == quote
+            return col
+        col = col + 1
+    0 - 1
+
+// find_prev_quote is the column of the nearest quote before `col_in` that
+// is not preceded by an odd number of backslashes, or 0.
+fn find_prev_quote<V: TextView>(view: V, line: Int, col_in: Int, quote: Int) -> Int
+    var col = col_in
+    while col > 0
+        col = col - 1
+        var n = 0
+        while col - n > 0 and view.char_at(line, col - n - 1) == '\\'
+            n = n + 1
+        if n % 2 == 1
+            col = col - n
+        else if view.char_at(line, col) == quote
+            break
+    col
+
+// obj_quote is `i"`, `a"` and the same for `'` and `` ` ``: Vim's
+// `current_quote` for a quote on one line.  A count of two or more takes the
+// quotes as well, for `i`.
+pub fn obj_quote<V: TextView>(view: V, cur: Pos, count: Int, include: Bool, quote: Int) -> Obj
+    let line = cur.line
+    let first_col = cur.col
+    var col_start = first_col
+    var col_end = 0
+    if view.ch(line, col_start) == quote
+        col_start = 0
+        var searching = true
+        while searching
+            col_start = find_next_quote(view, line, col_start, quote, false)
+            col_end = find_next_quote(view, line, col_start + 1, quote, true)
+            if col_end < 0
+                return obj_fail()
+            if col_start <= first_col and first_col <= col_end
+                searching = false
+            else
+                col_start = col_end + 1
+    else
+        col_start = find_prev_quote(view, line, col_start, quote)
+        if view.ch(line, col_start) != quote
+            col_start = find_next_quote(view, line, col_start, quote, false)
+            if col_start < 0
+                return obj_fail()
+        col_end = find_next_quote(view, line, col_start + 1, quote, true)
+        if col_end < 0
+            return obj_fail()
+    if include
+        if vimtext.is_blank(view.ch(line, col_end + 1))
+            while vimtext.is_blank(view.ch(line, col_end + 1))
+                col_end = col_end + 1
+        else
+            while col_start > 0 and vimtext.is_blank(view.ch(line, col_start - 1))
+                col_start = col_start - 1
+    if not include and count < 2
+        col_start = col_start + 1
+    var end_col = col_end
+    if include or count > 1
+        end_col = col_end + 1
+    Obj { ok: true, sl: line, sc: col_start, el: line, ec: end_col,
+          linewise: false, inclusive: false, vl: line, vc: end_col - 1 }

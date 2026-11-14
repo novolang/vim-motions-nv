@@ -1,0 +1,241 @@
+// key_tests.nv — keys as numbers and as text, the character classes and the
+// UTF-8 reading of text, and the lookups on a state.
+
+use std.test
+use std.list
+use keymodel
+use vimtext
+use vimkey
+use vimmodal
+
+fn pad_stroke(pad: Int, n: Int) -> KeyStroke
+    KeyStroke { press: KeyPress { kind: keymodel.KEY_PRESS_PAD, codepoint: 0,
+                                  name: keymodel.KEY_NAME_NONE, pad: pad, number: n },
+                mods: keymodel.no_mods(), motion: keymodel.KEY_DOWN_EVENT }
+
+fn alt_stroke(cp: Int) -> KeyStroke
+    keymodel.with_mods(keymodel.char_key(cp), KeyMods { shift: false, alt: true, ctrl: false, meta: false })
+
+@test
+fn test_a_control_number_is_the_control_byte() [io]
+    test.case("lower and upper case letters give the same byte")
+    test.assert_eq(vimkey.ctrl('r'), 18)
+    test.assert_eq(vimkey.ctrl('R'), 18)
+    test.case("a bracket gives escape")
+    test.assert_eq(vimkey.ctrl('['), 27)
+
+@test
+fn test_a_character_is_its_codepoint() [io]
+    test.case("plain characters")
+    test.assert_eq(vimkey.key_code(keymodel.char_key('x')), 'x')
+    test.assert_eq(vimkey.key_code(keymodel.char_key(0x4e2d)), 0x4e2d)
+    test.case("a release is ignored")
+    let up = KeyStroke { press: keymodel.key_char('x'),
+        mods: keymodel.no_mods(),
+        motion: keymodel.KEY_UP_EVENT }
+    test.assert_eq(vimkey.key_code(up), 0)
+    test.case("a repeat is a press")
+    let again = KeyStroke { press: keymodel.key_char('x'),
+        mods: keymodel.no_mods(),
+        motion: keymodel.KEY_REPEAT_EVENT }
+    test.assert_eq(vimkey.key_code(again), 'x')
+    test.case("alt marks the key")
+    test.assert_eq(vimkey.key_code(alt_stroke('x')), vimkey.KEY_ALT + 'x')
+
+@test
+fn test_control_and_a_character_is_a_control_byte() [io]
+    test.assert_eq(vimkey.key_code(keymodel.ctrl_key('r')), 18)
+    test.assert_eq(vimkey.key_code(keymodel.ctrl_key('R')), 18)
+    test.assert_eq(vimkey.key_code(keymodel.ctrl_key('[')), 27)
+    test.assert_eq(vimkey.key_code(keymodel.ctrl_key(' ')), 0)
+    test.case("control and h is backspace")
+    test.assert_eq(vimkey.key_code(keymodel.ctrl_key('h')), vimkey.K_BS)
+    test.assert_eq(vimkey.key_code(keymodel.ctrl_key('H')), vimkey.K_BS)
+    test.case("control and a digit is nothing")
+    test.assert_eq(vimkey.key_code(keymodel.ctrl_key('5')), 0)
+
+@test
+fn test_named_keys_are_numbers() [io]
+    test.assert_eq(vimkey.key_code(keymodel.named_key(keymodel.KEY_ESCAPE)), vimkey.K_ESC)
+    test.assert_eq(vimkey.key_code(keymodel.named_key(keymodel.KEY_ENTER)), vimkey.K_ENTER)
+    test.assert_eq(vimkey.key_code(keymodel.named_key(keymodel.KEY_TAB)), vimkey.K_TAB)
+    test.assert_eq(vimkey.key_code(keymodel.named_key(keymodel.KEY_BACKSPACE)), vimkey.K_BS)
+    test.assert_eq(vimkey.key_code(keymodel.named_key(keymodel.KEY_UP)), vimkey.K_UP)
+    test.assert_eq(vimkey.key_code(keymodel.named_key(keymodel.KEY_PAGE_DOWN)), vimkey.K_PAGE_DOWN)
+    test.case("a named key with a modifier is nothing")
+    let shifted = keymodel.with_mods(keymodel.named_key(keymodel.KEY_UP),
+        KeyMods { shift: true, alt: false, ctrl: false, meta: false })
+    test.assert_eq(vimkey.key_code(shifted), 0)
+
+@test
+fn test_keypad_keys_are_the_characters_they_type() [io]
+    test.assert_eq(vimkey.key_code(pad_stroke(keymodel.KEYPAD_DIGIT, 7)), '7')
+    test.assert_eq(vimkey.key_code(pad_stroke(keymodel.KEYPAD_ENTER, 0)), vimkey.K_ENTER)
+    test.assert_eq(vimkey.key_code(pad_stroke(keymodel.KEYPAD_PLUS, 0)), '+')
+    test.assert_eq(vimkey.key_code(pad_stroke(keymodel.KEYPAD_MINUS, 0)), '-')
+    test.assert_eq(vimkey.key_code(pad_stroke(keymodel.KEYPAD_STAR, 0)), '*')
+    test.assert_eq(vimkey.key_code(pad_stroke(keymodel.KEYPAD_SLASH, 0)), '/')
+    test.assert_eq(vimkey.key_code(pad_stroke(keymodel.KEYPAD_DOT, 0)), '.')
+    test.assert_eq(vimkey.key_code(pad_stroke(keymodel.KEYPAD_EQUAL, 0)), 0)
+    test.case("a press that names nothing")
+    let none = KeyStroke { press: keymodel.no_press(),
+        mods: keymodel.no_mods(),
+        motion: keymodel.KEY_DOWN_EVENT }
+    test.assert_eq(vimkey.key_code(none), 0)
+
+@test
+fn test_a_number_makes_a_keystroke_that_reads_back() [io]
+    let codes = [vimkey.K_ESC, vimkey.K_ENTER, vimkey.K_TAB, vimkey.K_BS, vimkey.K_UP, vimkey.K_END,
+                 1, 18, 26, 'a', 'Z', '5', 0x4e2d]
+    for c in codes
+        test.case("code ${c}")
+        test.assert_eq(vimkey.key_code(vimkey.stroke_of_code(c)), c)
+
+@test
+fn test_keys_written_in_angle_brackets() [io]
+    test.case("names")
+    let named = vimkey.codes_of("<Esc><CR><Tab><BS><Space><lt><bar><bslash><Del><Left><Right><Up><Down><Home><End><PageUp><PageDown>")
+    test.assert_eq(named, [27, 13, 9, 127, 32, '<', '|', '\\', vimkey.K_DELETE, vimkey.K_LEFT, vimkey.K_RIGHT,
+                           vimkey.K_UP, vimkey.K_DOWN, vimkey.K_HOME, vimkey.K_END, vimkey.K_PAGE_UP, vimkey.K_PAGE_DOWN])
+    test.case("control")
+    test.assert_eq(vimkey.codes_of("<C-r><C-W>"), [18, 23])
+    test.case("a name that is not a key is its characters")
+    test.assert_eq(vimkey.codes_of("<foo>"), ['<', 'f', 'o', 'o', '>'])
+    test.case("a bracket alone")
+    test.assert_eq(vimkey.codes_of("a<b"), ['a', '<', 'b'])
+    test.assert_eq(vimkey.codes_of("<>"), ['<', '>'])
+    test.case("text is read as UTF-8")
+    test.assert_eq(vimkey.codes_of("\u{e9}\u{4e2d}"), [0xe9, 0x4e2d])
+    test.case("keystrokes")
+    let ks = vimkey.keys_of("a<Esc>")
+    test.assert_eq(list.len(ks), 2)
+    test.assert_eq(vimkey.key_code(ks[0]), 'a')
+    test.assert_eq(vimkey.key_code(ks[1]), vimkey.K_ESC)
+
+@test
+fn test_the_classes_of_characters() [io]
+    test.case("blanks")
+    test.assert(vimtext.is_blank(' '))
+    test.assert(vimtext.is_blank('\t'))
+    test.assert(vimtext.is_blank('x') == false)
+    test.case("keyword characters")
+    test.assert(vimtext.is_word_char('a'))
+    test.assert(vimtext.is_word_char('Z'))
+    test.assert(vimtext.is_word_char('5'))
+    test.assert(vimtext.is_word_char('_'))
+    test.assert(vimtext.is_word_char('-') == false)
+    test.assert(vimtext.is_word_char(0 - 1) == false)
+    test.assert(vimtext.is_word_char(0xa9) == false)
+    test.assert(vimtext.is_word_char(0xe9))
+    test.assert(vimtext.is_word_char(0x4e2d))
+    test.assert(vimtext.is_word_char(0x2014) == false)
+    test.assert(vimtext.is_word_char(0x3002) == false)
+    test.case("classes")
+    test.assert_eq(vimtext.char_class(' ', false), vimtext.CLASS_BLANK)
+    test.assert_eq(vimtext.char_class(0, false), vimtext.CLASS_BLANK)
+    test.assert_eq(vimtext.char_class(0 - 1, false), vimtext.CLASS_BLANK)
+    test.assert_eq(vimtext.char_class('a', false), vimtext.CLASS_WORD)
+    test.assert_eq(vimtext.char_class('.', false), vimtext.CLASS_PUNCT)
+    test.assert_eq(vimtext.char_class('a', true), vimtext.CLASS_PUNCT)
+    test.assert_eq(vimtext.char_class(' ', true), vimtext.CLASS_BLANK)
+
+@test
+fn test_text_is_read_and_written_as_utf8() [io]
+    test.case("one to four bytes")
+    test.assert_eq(vimtext.decode_utf8("a\u{e9}\u{4e2d}\u{1f600}"), [97, 0xe9, 0x4e2d, 0x1f600])
+    test.assert_eq(vimtext.encode_utf8([97, 0xe9, 0x4e2d, 0x1f600]), "a\u{e9}\u{4e2d}\u{1f600}")
+    test.case("a byte that begins nothing is itself")
+    test.assert_eq(vimtext.decode_utf8("\xff"), [0xff])
+    test.case("a sequence cut short is its bytes")
+    test.assert_eq(vimtext.decode_utf8("\xe4\xb8"), [0xe4, 0xb8])
+    test.case("a lead byte followed by a byte that continues nothing")
+    test.assert_eq(vimtext.decode_utf8("\xc3x"), [0xc3, 'x'])
+    test.case("empty")
+    test.assert_eq(vimtext.decode_utf8(""), [])
+
+@test
+fn test_the_registers_and_marks_have_names() [io]
+    test.case("marks")
+    test.assert_eq(vimmodal.mark_slot('a'), 0)
+    test.assert_eq(vimmodal.mark_slot('z'), 25)
+    test.assert_eq(vimmodal.mark_slot('\''), vimmodal.MARK_JUMP)
+    test.assert_eq(vimmodal.mark_slot('`'), vimmodal.MARK_JUMP)
+    test.assert_eq(vimmodal.mark_slot('<'), vimmodal.MARK_VISUAL_START)
+    test.assert_eq(vimmodal.mark_slot('>'), vimmodal.MARK_VISUAL_END)
+    test.assert_eq(vimmodal.mark_slot('?'), 0 - 1)
+    test.case("registers")
+    test.assert_eq(vimmodal.reg_name_slot('0'), 0)
+    test.assert_eq(vimmodal.reg_name_slot('9'), 9)
+    test.assert_eq(vimmodal.reg_name_slot('-'), vimmodal.SLOT_SMALL_DELETE)
+    test.assert_eq(vimmodal.reg_name_slot('a'), vimmodal.SLOT_NAMED)
+    test.assert_eq(vimmodal.reg_name_slot('A'), vimmodal.SLOT_NAMED)
+    test.assert_eq(vimmodal.reg_name_slot('_'), vimmodal.SLOT_BLACK_HOLE)
+    test.assert_eq(vimmodal.reg_name_slot('!'), vimmodal.SLOT_NONE)
+
+@test
+fn test_a_new_state_is_empty() [io]
+    let m = vimmodal.modal_new()
+    test.assert_eq(m.mode, vimmodal.MODE_NORMAL)
+    test.assert_eq(m.mode_of(), vimmodal.MODE_NORMAL)
+    test.assert_eq(m.line, 0)
+    test.assert_eq(m.col, 0)
+    test.case("no register holds anything")
+    test.assert_eq(m.reg_text('"'), "")
+    test.assert_eq(m.reg_text('a'), "")
+    test.assert_eq(m.reg_text('!'), "")
+    test.assert(m.reg_is_linewise('"') == false)
+    test.assert(m.reg_is_linewise('a') == false)
+    test.case("no mark is set")
+    test.assert(m.mark_is_set(0) == false)
+    test.assert(m.mark_is_set(vimmodal.MARK_JUMP) == false)
+
+@test
+fn test_a_clone_shares_nothing_with_its_original() [io]
+    var m = vimmodal.modal_new()
+    m.mark_set(3, 4, 5)
+    m.reg_write_yank("text", false)
+    var n = vimmodal.modal_clone(m)
+    n.mark_set(3, 9, 9)
+    n.reg_write_yank("other", true)
+    test.assert_eq(m.marks_line[3], 4)
+    test.assert_eq(m.reg_text('0'), "text")
+    test.assert_eq(n.marks_line[3], 9)
+    test.assert_eq(n.reg_text('0'), "other")
+    test.assert(n.reg_is_linewise('0'))
+
+@test
+fn test_registers_are_written_by_the_rules_of_the_editor() [io]
+    var m = vimmodal.modal_new()
+    test.case("a yank goes to the yank register and the unnamed one points at it")
+    m.reg_write_yank("a", false)
+    test.assert_eq(m.reg_text('"'), "a")
+    test.assert_eq(m.reg_text('0'), "a")
+    test.case("a small delete goes to the minus register")
+    m.reg_write_delete("b", false, false)
+    test.assert_eq(m.reg_text('"'), "b")
+    test.assert_eq(m.reg_text('-'), "b")
+    test.assert_eq(m.reg_text('1'), "")
+    test.case("a line delete shifts the numbered registers")
+    m.reg_write_delete("one", true, false)
+    m.reg_write_delete("two", true, false)
+    test.assert_eq(m.reg_text('1'), "two")
+    test.assert_eq(m.reg_text('2'), "one")
+    test.case("a named register is appended to by its capital")
+    m.reg = 'a'
+    m.reg_write_yank("x", false)
+    m.reg = 'A'
+    m.reg_write_yank("y", false)
+    test.assert_eq(m.reg_text('a'), "xy")
+    m.reg = 'A'
+    m.reg_write_yank("z", true)
+    test.assert_eq(m.reg_text('a'), "xy\nz")
+    test.assert(m.reg_is_linewise('a'))
+    test.case("the black hole keeps nothing")
+    m.reg = '_'
+    m.reg_write_yank("gone", false)
+    m.reg_write_delete("gone", false, false)
+    test.assert_eq(m.reg_text('"'), "xy\nz")
+    test.case("a register that is not one is the yank register")
+    m.reg = '!'
+    m.reg_write_yank("q", false)
+    test.assert_eq(m.reg_text('0'), "q")

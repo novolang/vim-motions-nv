@@ -1,0 +1,1033 @@
+// vimnormal.nv — Normal mode, Operator-pending mode and Visual mode: what
+// each key does, and how a command is built from a count, a register, an
+// operator and a motion.
+//
+// A command is typed one key at a time, so the parts of it that are typed
+// are kept in the `Modal` until it is complete: the count, the register
+// named with `"`, the operator, the count after the operator, and a prefix
+// key such as `g` that waits for the key after it.  The keys of a command,
+// without its counts and register, are kept as well, because the dot
+// command types them again.
+
+use std.list
+use std.str
+use vimtext
+use vimmodal
+use vimmotion
+use vimobject
+use vimedit
+use viminsert
+use vimscroll
+use vimkey
+
+// ── Small helpers ───────────────────────────────────────────────────
+
+// eff_count is the count of a command: the count before the operator times
+// the count after it, or whichever was typed, or zero for none.
+fn eff_count(m: Modal) -> Int
+    var c = 0
+    if m.reg_count > 0
+        c = m.reg_count
+    if m.count > 0
+        c = if c == 0
+            m.count
+        else
+            c * m.count
+    if m.op_count > 0
+        c = if c == 0
+            m.op_count
+        else
+            c * m.op_count
+    c
+
+// n1 is the count of a command, one when there is none.
+fn n1(m: Modal) -> Int
+    let c = eff_count(m)
+    if c < 1
+        1
+    else
+        c
+
+// cur_pos is the cursor as a place.
+fn cur_pos(m: Modal) -> Pos
+    vimtext.pos_new(m.line, m.col)
+
+// bell refuses a key and forgets the command being typed.
+fn bell(var m: Modal)
+    m.emit(Bell)
+    m.reset_pending()
+
+// record_change remembers the command being typed so that `.` can type it
+// again.  A change made by `.` itself is not recorded.
+fn record_change(var m: Modal)
+    if m.replaying
+        return
+    m.dot_keys = list.clone(m.cmd_keys)
+    m.dot_count = eff_count(m)
+    m.dot_reg = m.reg
+    m.dot_text = []
+    m.dot_valid = true
+
+// op_of is the operator a key starts, or `OP_NONE`.
+fn op_of(code: Int) -> Int
+    if code == 'd'
+        OP_DELETE
+    else if code == 'c'
+        OP_CHANGE
+    else if code == 'y'
+        OP_YANK
+    else if code == '>'
+        OP_SHIFT_RIGHT
+    else if code == '<'
+        OP_SHIFT_LEFT
+    else
+        OP_NONE
+
+// doubled_key is the key that, typed after a case operator, makes it work on
+// whole lines: `u` after `gu`.  The other operators are doubled by typing
+// their own key.
+fn doubled_key(op: Int) -> Int
+    if op == OP_LOWER
+        'u'
+    else if op == OP_UPPER
+        'U'
+    else
+        '~'
+
+// is_change_op says whether an operator changes the text, which is every
+// one but yank.
+fn is_change_op(op: Int) -> Bool
+    op != OP_YANK and op != OP_NONE
+
+// ── Finishing a command ─────────────────────────────────────────────
+
+// run_pending runs the pending operator over a range.
+fn run_pending<V: TextView>(var m: Modal, view: V, r: Rgn, big: Bool)
+    let op = m.op
+    if is_change_op(op)
+        record_change(var m)
+    let levels = 1
+    let reg_keep = m.reg
+    m.reset_pending()
+    m.reg = reg_keep
+    vimedit.run_op(var m, view, op, r, big, levels)
+    m.reg = 0
+
+// set_want sets the wanted column from what a motion says.
+fn set_want(var m: Modal, mv: Mv)
+    if mv.want == WANT_FROM_COL
+        m.want = m.col
+    else if mv.want == WANT_KEEP
+        m.want = m.want
+    else
+        m.want = mv.want
+
+// finish_motion carries out a motion that was computed from the cursor
+// `cur`: it moves the cursor, or hands the range to the pending operator.
+fn finish_motion<V: TextView>(var m: Modal, view: V, mv: Mv, cur: Pos)
+    if mv.jump and (mv.ok or m.op == OP_NONE)
+        m.mark_set(MARK_JUMP, cur.line, cur.col)
+    if m.op != OP_NONE
+        if not mv.ok
+            m.line = mv.line
+            m.col = mv.col
+            bell(var m)
+            return
+        let r = vimedit.make_rgn(view, m.op, cur, vimtext.pos_new(mv.line, mv.col), mv.linewise, mv.inclusive)
+        run_pending(var m, view, r, mv.big)
+        return
+    if not mv.ok
+        m.emit(Bell)
+    m.line = mv.line
+    m.col = mv.col
+    set_want(var m, mv)
+    m.nonblank = false
+    if vimmodal.is_visual(m.mode) and m.want == WANT_END and view.len_at(m.line) > 0
+        m.col = view.len_at(m.line)
+    m.reset_pending()
+    m.emit(MoveCursor(line: m.line, col: m.col))
+
+// ── Visual mode ─────────────────────────────────────────────────────
+
+// enter_visual starts a selection at the cursor.
+fn enter_visual(var m: Modal, mode: Int)
+    m.anchor_line = m.line
+    m.anchor_col = m.col
+    m.set_mode(mode)
+
+// leave_visual ends a selection and remembers it.
+fn leave_visual(var m: Modal)
+    m.mark_set(MARK_VISUAL_START, m.anchor_line, m.anchor_col)
+    m.mark_set(MARK_VISUAL_END, m.line, m.col)
+    m.last_visual_mode = m.mode
+    m.set_mode(MODE_NORMAL)
+
+// visual_region is the range the selection covers.
+fn visual_region<V: TextView>(m: Modal, view: V) -> Rgn
+    vimedit.visual_rgn(view, m.mode, vimtext.pos_new(m.anchor_line, m.anchor_col), vimtext.pos_new(m.line, m.col))
+
+// lines_start_col is the column the cursor takes when an operator works on
+// the whole lines of a selection: column zero when the selection began above
+// the cursor, and the cursor's own column when it began below.
+fn lines_start_col(m: Modal) -> Int
+    if m.anchor_line < m.line or m.anchor_line == m.line and m.col > 0
+        0
+    else
+        m.col
+
+// visual_op applies an operator to the selection.
+fn visual_op<V: TextView>(var m: Modal, view: V, op: Int, force_lines: Bool)
+    var r = visual_region(m, view)
+    if force_lines or r.linewise
+        r = vimedit.rgn_lines(r.sl, lines_start_col(m), r.el)
+    let levels = n1(m)
+    leave_visual(var m)
+    m.line = r.sl
+    m.col = r.sc
+    let reg_keep = m.reg
+    m.reset_pending()
+    m.reg = reg_keep
+    vimedit.run_op(var m, view, op, r, false, levels)
+    m.reg = 0
+
+// visual_replace is `r{char}` over the selection.
+fn visual_replace<V: TextView>(var m: Modal, view: V, c: Int)
+    let r = visual_region(m, view)
+    let start_col = if r.linewise
+        lines_start_col(m)
+    else
+        r.sc
+    leave_visual(var m)
+    m.reset_pending()
+    m.begin_change()
+    var l = r.sl
+    while l <= r.el
+        let n = view.len_at(l)
+        var from = 0
+        var to = n
+        if not r.linewise and l == r.sl
+            from = r.sc
+        if not r.linewise and l == r.el
+            to = r.ec
+        if to > from
+            m.emit(ReplaceChar(line: l, col: from, count: to - from, ch: c))
+        l = l + 1
+    m.place(r.sl, start_col)
+
+// visual_join is `J` and `gJ` over the selection.
+fn visual_join<V: TextView>(var m: Modal, view: V, spaces: Bool)
+    var first = m.anchor_line
+    var last = m.line
+    var first_col = m.anchor_col
+    if last < first or last == first and m.col < m.anchor_col
+        first = m.line
+        first_col = m.col
+        last = m.anchor_line
+    let start_col = if m.mode == MODE_VISUAL_LINE
+        lines_start_col(m)
+    else
+        first_col
+    leave_visual(var m)
+    m.reset_pending()
+    m.line = first
+    m.col = start_col
+    var cnt = last - first + 1
+    if cnt < 2
+        cnt = 2
+    if not vimedit.join_lines(var m, view, cnt, spaces)
+        m.emit(Bell)
+
+// visual_put is `p` and `P` over the selection: the selection is replaced
+// by the register.  `p` leaves the replaced text in the unnamed register.
+fn visual_put<V: TextView>(var m: Modal, view: V, keep_register: Bool)
+    let name = if m.reg != 0
+        m.reg
+    else
+        '"'
+    let slot = m.reg_slot(name)
+    if slot < 0 or not m.regs_set[slot]
+        bell(var m)
+        return
+    let text = m.regs[slot]
+    let lw = m.regs_linewise[slot]
+    let r = visual_region(m, view)
+    leave_visual(var m)
+    m.reset_pending()
+    m.line = r.sl
+    m.col = r.sc
+    m.begin_change()
+    if not keep_register
+        m.reg_write_delete(vimedit_text(view, r), r.linewise, false)
+    if r.linewise
+        let k = count_lines(text)
+        m.emit(Put(line: r.sl, col: 0, text: text, linewise: true))
+        m.emit(Delete(span: Span.lines(r.sl + k, r.el + k)))
+        m.place(r.sl, 0)
+        m.nonblank = true
+    else
+        m.emit(Delete(span: Span.chars(r.sl, r.sc, r.el, r.ec)))
+        if lw
+            m.emit(Insert(line: r.sl, col: r.sc, text: "\n" + text + "\n"))
+            m.place(r.sl + 1, 0)
+            m.nonblank = true
+        else
+            m.emit(Put(line: r.sl, col: r.sc, text: text, linewise: false))
+            let cps = vimtext.decode_utf8(text)
+            if list.contains(cps, '\n')
+                m.place(r.sl, r.sc)
+            else
+                m.place(r.sl, r.sc + list.len(cps) - 1)
+    m.reg = 0
+
+// count_lines is the number of lines in a text.
+fn count_lines(text: Str) -> Int
+    str.count(text, "\n") + 1
+
+// vimedit_text is the text a range covers.
+fn vimedit_text<V: TextView>(view: V, r: Rgn) -> Str
+    if r.linewise
+        view.lines_text(r.sl, r.el)
+    else
+        view.text_between(vimtext.pos_new(r.sl, r.sc), vimtext.pos_new(r.el, r.ec))
+
+// ── Motions ─────────────────────────────────────────────────────────
+
+// is_motion_key says whether a key, typed alone, is a motion.
+fn is_motion_key(code: Int) -> Bool
+    code == 'h' or code == 'l' or code == 'j' or code == 'k' or code == ' '
+        or code == K_BS or code == K_LEFT or code == K_RIGHT or code == K_UP
+        or code == K_DOWN or code == C_J or code == C_N or code == C_P
+        or code == '+' or code == '-' or code == '_' or code == K_ENTER
+        or code == '0' or code == '^' or code == '$' or code == '|'
+        or code == K_HOME or code == K_END
+        or code == 'w' or code == 'W' or code == 'e' or code == 'E'
+        or code == 'b' or code == 'B' or code == '{' or code == '}'
+        or code == '(' or code == ')' or code == '%'
+        or code == 'H' or code == 'M' or code == 'L' or code == 'G'
+        or code == ';' or code == ','
+
+// compute_motion is the motion a key makes from the cursor.  `has` says
+// whether a count was typed, and `cnt` is the count.
+fn compute_motion<V: TextView>(m: Modal, view: V, code: Int, cnt: Int, has: Bool) -> Mv
+    let cur = cur_pos(m)
+    let op_pending = m.op != OP_NONE
+    let n = if cnt < 1
+        1
+    else
+        cnt
+    if code == 'h' or code == K_LEFT or code == K_BS
+        vimmotion.motion_h(cur, n, op_pending)
+    else if code == 'l' or code == K_RIGHT or code == ' '
+        vimmotion.motion_l(view, cur, n, op_pending, vimmodal.is_visual(m.mode))
+    else if code == 'j' or code == K_DOWN or code == C_J or code == C_N
+        vimmotion.motion_j(view, cur, n, m.want)
+    else if code == 'k' or code == K_UP or code == C_P
+        vimmotion.motion_j(view, cur, 0 - n, m.want)
+    else if code == '+' or code == K_ENTER
+        vimmotion.motion_first_nonblank_down(view, cur, n)
+    else if code == '-'
+        vimmotion.motion_first_nonblank_down(view, cur, 0 - n)
+    else if code == '_'
+        vimmotion.motion_underscore(view, cur, n)
+    else if code == '0' or code == K_HOME
+        vimmotion.motion_zero(cur)
+    else if code == '^'
+        vimmotion.motion_caret(view, cur)
+    else if code == '$' or code == K_END
+        vimmotion.motion_dollar(view, cur, n)
+    else if code == '|'
+        vimmotion.motion_bar(view, cur, n)
+    else if code == 'w' or code == 'W'
+        vimmotion.motion_w(view, cur, n, code == 'W', op_pending, m.op == OP_CHANGE, vimmodal.is_visual(m.mode))
+    else if code == 'e' or code == 'E'
+        vimmotion.motion_e(view, cur, n, code == 'E', op_pending, vimmodal.is_visual(m.mode))
+    else if code == 'b' or code == 'B'
+        vimmotion.motion_b(view, cur, n, code == 'B')
+    else if code == '(' or code == ')'
+        vimmotion.motion_sentence(view, cur, n, code == ')')
+    else if code == '{'
+        vimmotion.motion_paragraph(view, cur, n, false)
+    else if code == '}'
+        vimmotion.motion_paragraph(view, cur, n, true)
+    else if code == '%'
+        if has
+            vimmotion.motion_percent_count(view, cur, cnt)
+        else
+            vimmotion.motion_percent(view, cur)
+    else if code == 'H' or code == 'M' or code == 'L'
+        vimmotion.motion_window(view, code, n)
+    else if code == 'G'
+        vimmotion.motion_gg(view, has, cnt, true)
+    else if code == ';' and m.find_kind != 0
+        vimmotion.motion_find(view, cur, m.find_kind, m.find_ch, n, true)
+    else if code == ',' and m.find_kind != 0
+        vimmotion.motion_find(view, cur, reverse_find(m.find_kind), m.find_ch, n, true)
+    else
+        vimmotion.mv_fail(cur.line, cur.col)
+
+// reverse_find is the find motion that goes the other way.
+fn reverse_find(kind: Int) -> Int
+    if kind == FIND_F
+        FIND_BACK_F
+    else if kind == FIND_T
+        FIND_BACK_T
+    else if kind == FIND_BACK_F
+        FIND_F
+    else
+        FIND_T
+
+// do_motion runs the motion a key makes.
+fn do_motion<V: TextView>(var m: Modal, view: V, code: Int)
+    let cnt = eff_count(m)
+    let mv = compute_motion(m, view, code, cnt, cnt > 0)
+    finish_motion(var m, view, mv, cur_pos(m))
+
+// line_op is an operator typed twice: it works on `count` lines.
+fn line_op<V: TextView>(var m: Modal, view: V)
+    let n = n1(m)
+    let cur = cur_pos(m)
+    var tgt = cur
+    if n > 1
+        let mv = vimmotion.motion_j(view, cur, n - 1, m.want)
+        if not mv.ok
+            bell(var m)
+            return
+        tgt = vimtext.pos_new(mv.line, mv.col)
+    if m.op != OP_YANK
+        tgt = vimtext.pos_new(tgt.line, view.first_nonblank(tgt.line))
+    let r = vimedit.make_rgn(view, m.op, cur, tgt, true, false)
+    run_pending(var m, view, r, false)
+
+// ── Searching and the command line ──────────────────────────────────
+
+// Ident is what `*` and `#` search for: the columns of a keyword at or after
+// the cursor, or when there is none, of the run of characters that are not
+// blank.  `whole` says that the match must not be part of a longer word.
+@value
+struct Ident
+    ok: Bool
+    start: Int
+    end: Int
+    whole: Bool
+
+// find_ident finds the keyword, or failing that the run of non-blank
+// characters, at or after a column of a line.
+fn find_ident<V: TextView>(view: V, line: Int, col: Int) -> Ident
+    let n = view.len_at(line)
+    var c = col
+    while c < n and not vimtext.is_word_char(view.char_at(line, c))
+        c = c + 1
+    if c < n
+        var s = c
+        while s > 0 and vimtext.is_word_char(view.char_at(line, s - 1))
+            s = s - 1
+        var e = c
+        while e < n and vimtext.is_word_char(view.char_at(line, e))
+            e = e + 1
+        return Ident { ok: true, start: s, end: e, whole: true }
+    c = col
+    while c < n and vimtext.is_blank(view.char_at(line, c))
+        c = c + 1
+    if c >= n
+        return Ident { ok: false, start: 0, end: 0, whole: false }
+    var s2 = c
+    while s2 > 0 and not vimtext.is_blank(view.char_at(line, s2 - 1))
+        s2 = s2 - 1
+    var e2 = c
+    while e2 < n and not vimtext.is_blank(view.char_at(line, e2))
+        e2 = e2 + 1
+    Ident { ok: true, start: s2, end: e2, whole: false }
+
+// start_search asks the host to search, and waits for its answer.
+fn start_search(var m: Modal, forward: Bool, pattern: Str, whole: Bool)
+    m.emit(Search(forward: forward, pattern: pattern, whole_word: whole, count: n1(m)))
+    m.search_wait = true
+
+// search_key is `n`, `N`, `*` and `#`.
+fn search_key<V: TextView>(var m: Modal, view: V, code: Int)
+    if code == 'n'
+        start_search(var m, m.search_forward, "", false)
+    else if code == 'N'
+        start_search(var m, not m.search_forward, "", false)
+    else
+        let id = find_ident(view, m.line, m.col)
+        if not id.ok
+            bell(var m)
+            return
+        let w = view.text_between(vimtext.pos_new(m.line, id.start), vimtext.pos_new(m.line, id.end))
+        m.mark_set(MARK_JUMP, m.line, m.col)
+        m.col = id.start
+        m.search_forward = code == '*'
+        start_search(var m, code == '*', w, id.whole)
+
+// enter_cmdline starts a command line the host will read.
+fn enter_cmdline(var m: Modal, kind: Int, initial: Str)
+    m.prev_mode = m.mode
+    m.cmdline_kind = kind
+    m.set_mode(MODE_CMDLINE)
+    m.emit(EnterCommandLine(kind: kind, initial: initial))
+
+// cmdline_key is `:`, `/` and `?`.
+fn cmdline_key<V: TextView>(var m: Modal, view: V, code: Int)
+    if code == ':'
+        var initial = ""
+        if vimmodal.is_visual(m.mode)
+            initial = "'<,'>"
+            leave_visual(var m)
+        else if eff_count(m) > 0
+            let c = eff_count(m)
+            initial = if c == 1
+                "."
+            else
+                ".,.+" + str.from_int(c - 1)
+        enter_cmdline(var m, CMDLINE_EX, initial)
+    else
+        enter_cmdline(var m, (if code == '/' then CMDLINE_SEARCH_FORWARD else CMDLINE_SEARCH_BACKWARD), "")
+
+// ── Second keys ─────────────────────────────────────────────────────
+
+// text_object is `i` or `a` followed by the kind of object, with an operator
+// pending or in Visual mode.
+fn text_object<V: TextView>(var m: Modal, view: V, around: Bool, kind: Int)
+    let cur = cur_pos(m)
+    let cnt = n1(m)
+    let vis = vimmodal.is_visual(m.mode)
+    let anchor = vimtext.pos_new(m.anchor_line, m.anchor_col)
+    var o = vimobject.obj_fail()
+    if kind == 'w' or kind == 'W'
+        o = vimobject.obj_word(view, cur, anchor, vis, cnt, around, kind == 'W')
+    else if kind == 's'
+        let so = vimmotion.obj_sentence(view, cur, cnt, around)
+        o = vimobject.Obj { ok: so.ok, sl: so.sl, sc: so.sc, el: so.el, ec: so.ec,
+                            linewise: false, inclusive: so.inclusive,
+                            vl: so.vl, vc: so.vc }
+    else if kind == 'p'
+        o = vimobject.obj_paragraph(view, cur, anchor, vis, m.mode == MODE_VISUAL_LINE, cnt, around)
+    else if kind == '(' or kind == ')' or kind == 'b'
+        o = vimobject.obj_block(view, cur, anchor, vis, cnt, around, '(', ')')
+    else if kind == '[' or kind == ']'
+        o = vimobject.obj_block(view, cur, anchor, vis, cnt, around, '[', ']')
+    else if kind == '{' or kind == '}' or kind == 'B'
+        o = vimobject.obj_block(view, cur, anchor, vis, cnt, around, '{', '}')
+    else if kind == '<' or kind == '>'
+        o = vimobject.obj_block(view, cur, anchor, vis, cnt, around, '<', '>')
+    else if kind == '"' or kind == '\'' or kind == '`'
+        o = vimobject.obj_quote(view, cur, cnt, around, kind)
+    if not o.ok
+        if o.el >= 0
+            m.line = o.el
+            m.col = o.ec
+        bell(var m)
+        return
+    if vimmodal.is_visual(m.mode)
+        select_object(var m, view, o, kind == 'p' and not o.linewise)
+    else
+        let r = rgn_from_obj(view, m.op, o)
+        run_pending(var m, view, r, false)
+
+// rgn_from_obj is the range of a text object for an operator.
+fn rgn_from_obj<V: TextView>(view: V, op: Int, o: Obj) -> Rgn
+    vimedit.make_rgn(view, op, vimtext.pos_new(o.sl, o.sc), vimtext.pos_new(o.el, o.ec), o.linewise, o.inclusive)
+
+// select_object makes a text object the selection, in Visual mode.
+fn select_object<V: TextView>(var m: Modal, view: V, o: Obj, keep_mode: Bool)
+    m.anchor_line = o.sl
+    m.anchor_col = o.sc
+    m.line = o.vl
+    m.col = o.vc
+    m.want = o.vc
+    if not keep_mode
+        m.set_mode((if o.linewise then MODE_VISUAL_LINE else MODE_VISUAL))
+    m.reset_pending()
+    m.emit(MoveCursor(line: m.line, col: m.col))
+
+// g_key is the key after `g`.
+fn g_key<V: TextView>(var m: Modal, view: V, code: Int)
+    m.prefix = 0
+    let vis = vimmodal.is_visual(m.mode)
+    if code == 'g'
+        let cnt = eff_count(m)
+        let mv = vimmotion.motion_gg(view, cnt > 0, cnt, false)
+        finish_motion(var m, view, mv, cur_pos(m))
+    else if code == 'e' or code == 'E'
+        let mv = vimmotion.motion_ge(view, cur_pos(m), n1(m), code == 'E')
+        finish_motion(var m, view, mv, cur_pos(m))
+    else if code == '_'
+        let mv = vimmotion.motion_g_underscore(view, cur_pos(m), n1(m))
+        finish_motion(var m, view, mv, cur_pos(m))
+    else if code == 'j' or code == 'k' or code == '0' or code == '^' or code == '$'
+        do_motion(var m, view, code)
+    else if code == 'u' or code == 'U' or code == '~'
+        let op = if code == 'u'
+            OP_LOWER
+        else
+            if code == 'U'
+                OP_UPPER
+            else
+                OP_TOGGLE
+        if vis
+            visual_op(var m, view, op, false)
+        else if m.op == op
+            line_op(var m, view)
+        else if m.op == OP_NONE
+            m.op = op
+        else
+            bell(var m)
+    else if code == 'J'
+        if vis
+            visual_join(var m, view, false)
+        else
+            record_change(var m)
+            let cnt = eff_count(m)
+            m.reset_pending()
+            if not vimedit.join_lines(var m, view, cnt, false)
+                m.emit(Bell)
+    else if code == 'v' and not vis and m.op == OP_NONE
+        regain_visual(var m, view)
+    else if code == 'I' and not vis and m.op == OP_NONE
+        record_change(var m)
+        let cnt = n1(m)
+        m.reset_pending()
+        m.place(m.line, 0)
+        viminsert.insert_start(var m, view, MODE_INSERT, cnt, 0)
+    else
+        bell(var m)
+
+// is_case_op says whether an operator is one of the case operators.
+fn is_case_op(op: Int) -> Bool
+    op == OP_LOWER or op == OP_UPPER or op == OP_TOGGLE
+
+// regain_visual is `gv`: the last selection again.
+fn regain_visual<V: TextView>(var m: Modal, view: V)
+    if not m.mark_is_set(MARK_VISUAL_START)
+        bell(var m)
+        return
+    m.anchor_line = m.marks_line[MARK_VISUAL_START]
+    m.anchor_col = m.marks_col[MARK_VISUAL_START]
+    m.line = m.marks_line[MARK_VISUAL_END]
+    m.col = m.marks_col[MARK_VISUAL_END]
+    m.want = m.col
+    m.set_mode(m.last_visual_mode)
+    m.reset_pending()
+
+// z_key is the key after `z`.
+fn z_key<V: TextView>(var m: Modal, view: V, code: Int)
+    m.prefix = 0
+    if code == 't' or code == K_ENTER
+        vimscroll.scroll_cursor_line(var m, view, 0)
+        if code == K_ENTER
+            m.nonblank = true
+    else if code == 'z' or code == '.'
+        vimscroll.scroll_cursor_line(var m, view, 1)
+        if code == '.'
+            m.nonblank = true
+    else if code == 'b' or code == '-'
+        vimscroll.scroll_cursor_line(var m, view, 2)
+        if code == '-'
+            m.nonblank = true
+    else
+        m.emit(Bell)
+    m.reset_pending()
+
+// mark_target is the motion `'x` and `` `x `` make.
+fn mark_target<V: TextView>(m: Modal, view: V, code: Int, name: Int) -> Mv
+    let slot = vimmodal.mark_slot(name)
+    if slot < 0 or not m.mark_is_set(slot)
+        return vimmotion.mv_fail(m.line, m.col)
+    var l = m.marks_line[slot]
+    if l > view.last_line()
+        l = view.last_line()
+    if code == '\''
+        return Mv { ok: true, line: l, col: view.first_nonblank(l), linewise: true,
+                    inclusive: false, jump: true, big: false,
+                    want: WANT_FROM_COL }
+    var c = m.marks_col[slot]
+    if c > view.len_at(l) - 1
+        c = view.len_at(l) - 1
+    if c < 0
+        c = 0
+    Mv { ok: true, line: l, col: c, linewise: false, inclusive: false,
+         jump: true, big: true, want: WANT_FROM_COL }
+
+// prefix_key handles the key that follows a prefix key.
+fn prefix_key<V: TextView>(var m: Modal, view: V, code: Int)
+    let p = m.prefix
+    if code == K_ESC
+        m.prefix = 0
+        m.reset_pending()
+        return
+    if p == '"'
+        m.prefix = 0
+        let s = vimmodal.reg_name_slot(code)
+        if s == SLOT_NONE and code != '"'
+            bell(var m)
+        else
+            m.reg = code
+            if m.count > 0
+                m.reg_count = m.count
+                m.count = 0
+    else if p == 'g'
+        g_key(var m, view, code)
+    else if p == 'z'
+        z_key(var m, view, code)
+    else if p == 'm'
+        m.prefix = 0
+        let slot = vimmodal.mark_slot(code)
+        if slot < 0 or slot > MARK_JUMP
+            bell(var m)
+        else
+            m.mark_set(slot, m.line, m.col)
+            m.reset_pending()
+    else if p == '\'' or p == '`'
+        m.prefix = 0
+        let mv = mark_target(m, view, p, code)
+        finish_motion(var m, view, mv, cur_pos(m))
+    else if p == 'f' or p == 'F' or p == 't' or p == 'T'
+        m.prefix = 0
+        let kind = if p == 'f'
+            FIND_F
+        else
+            if p == 'F'
+                FIND_BACK_F
+            else
+                if p == 't'
+                    FIND_T
+                else
+                    FIND_BACK_T
+        m.find_kind = kind
+        m.find_ch = code
+        let mv = vimmotion.motion_find(view, cur_pos(m), kind, code, n1(m), false)
+        finish_motion(var m, view, mv, cur_pos(m))
+    else if p == 'r'
+        m.prefix = 0
+        if vimmodal.is_visual(m.mode)
+            visual_replace(var m, view, code)
+        else
+            record_change(var m)
+            let cnt = n1(m)
+            m.reset_pending()
+            if not vimedit.replace_chars(var m, view, code, cnt)
+                m.emit(Bell)
+    else
+        m.prefix = 0
+        text_object(var m, view, p == 'a', code)
+
+// ── Commands ────────────────────────────────────────────────────────
+
+// operate_with runs an operator over the motion of a key, as the commands
+// `x`, `X`, `D`, `C` and `s` do.
+fn operate_with<V: TextView>(var m: Modal, view: V, op: Int, motion: Int)
+    m.op = op
+    do_motion(var m, view, motion)
+
+// operate_lines runs an operator over the lines of the count, as `S` and
+// `Y` do.
+fn operate_lines<V: TextView>(var m: Modal, view: V, op: Int)
+    m.op = op
+    line_op(var m, view)
+
+// put_command is `p` and `P`.
+fn put_command<V: TextView>(var m: Modal, view: V, before: Bool)
+    record_change(var m)
+    let cnt = n1(m)
+    let name = if m.reg != 0
+        m.reg
+    else
+        '"'
+    m.reset_pending()
+    if not vimedit.put_register(var m, view, before, cnt, name)
+        m.emit(Bell)
+
+// insert_command is `i`, `a`, `I`, `A` and `R`.
+fn insert_command<V: TextView>(var m: Modal, view: V, code: Int)
+    record_change(var m)
+    let cnt = n1(m)
+    m.reset_pending()
+    let n = view.len_at(m.line)
+    if code == 'a' and n > 0
+        m.place(m.line, m.col + 1)
+    else if code == 'A'
+        m.place(m.line, n)
+    else if code == 'I'
+        m.place(m.line, view.first_nonblank_raw(m.line))
+    m.begin_change()
+    viminsert.insert_start(var m, view, (if code == 'R' then MODE_REPLACE else MODE_INSERT), cnt, 0)
+
+// dot_repeat is `.`: the last change, typed again.
+fn dot_repeat<V: TextView>(var m: Modal, view: V)
+    if not m.dot_valid
+        bell(var m)
+        return
+    let given = eff_count(m)
+    let keys = list.clone(m.dot_keys)
+    let reg = if m.dot_reg != 0
+        m.dot_reg
+    else
+        m.reg
+    var cnt = m.dot_count
+    if given > 0
+        cnt = given
+        m.dot_count = given
+    m.reset_pending()
+    m.count = cnt
+    m.reg = reg
+    m.replaying = true
+    for k in keys
+        normal_key(var m, view, k)
+    m.replaying = false
+    m.reset_pending()
+
+// undo_command is `u` and `Ctrl-R`.
+fn undo_command(var m: Modal, redo: Bool)
+    let cnt = n1(m)
+    m.reset_pending()
+    var i = 0
+    while i < cnt
+        m.emit((if redo then Redo else Undo))
+        i = i + 1
+
+// scroll_command is the scroll keys.
+fn scroll_command<V: TextView>(var m: Modal, view: V, code: Int)
+    let cnt = eff_count(m)
+    m.reset_pending()
+    if code == C_E
+        vimscroll.scroll_lines(var m, view, (if cnt < 1 then 1 else cnt))
+    else if code == C_Y
+        vimscroll.scroll_lines(var m, view, 0 - (if cnt < 1 then 1 else cnt))
+    else if code == C_D
+        vimscroll.scroll_half(var m, view, true, cnt)
+    else if code == C_U
+        vimscroll.scroll_half(var m, view, false, cnt)
+    else if code == C_F
+        vimscroll.scroll_page(var m, view, true, cnt)
+    else
+        vimscroll.scroll_page(var m, view, false, cnt)
+
+// normal_command is a key that is a command of its own in Normal mode.
+fn normal_command<V: TextView>(var m: Modal, view: V, code: Int)
+    if code == 'x'
+        operate_with(var m, view, OP_DELETE, 'l')
+    else if code == 'X'
+        operate_with(var m, view, OP_DELETE, 'h')
+    else if code == 'D'
+        operate_with(var m, view, OP_DELETE, '$')
+    else if code == 'C'
+        operate_with(var m, view, OP_CHANGE, '$')
+    else if code == 's'
+        operate_with(var m, view, OP_CHANGE, 'l')
+    else if code == 'S'
+        operate_lines(var m, view, OP_CHANGE)
+    else if code == 'Y'
+        operate_lines(var m, view, OP_YANK)
+    else if code == 'p'
+        put_command(var m, view, false)
+    else if code == 'P'
+        put_command(var m, view, true)
+    else if code == 'J'
+        record_change(var m)
+        let cnt = eff_count(m)
+        m.reset_pending()
+        if not vimedit.join_lines(var m, view, cnt, true)
+            m.emit(Bell)
+    else if code == '~'
+        record_change(var m)
+        let cnt = n1(m)
+        m.reset_pending()
+        if not vimedit.toggle_chars(var m, view, cnt)
+            m.emit(Bell)
+    else if code == 'u'
+        undo_command(var m, false)
+    else if code == C_R
+        undo_command(var m, true)
+    else if code == '.'
+        dot_repeat(var m, view)
+    else if code == 'i' or code == 'a' or code == 'I' or code == 'A' or code == 'R'
+        insert_command(var m, view, code)
+    else if code == 'o' or code == 'O'
+        record_change(var m)
+        let cnt = n1(m)
+        m.reset_pending()
+        vimedit.open_line(var m, view, code == 'o', cnt)
+    else if code == 'v'
+        m.reset_pending()
+        enter_visual(var m, MODE_VISUAL)
+    else if code == 'V'
+        m.reset_pending()
+        enter_visual(var m, MODE_VISUAL_LINE)
+    else if code == C_D or code == C_U or code == C_F or code == C_B or code == C_E or code == C_Y
+        scroll_command(var m, view, code)
+    else
+        bell(var m)
+
+// visual_command is a key that is a command of its own in Visual mode.
+fn visual_command<V: TextView>(var m: Modal, view: V, code: Int)
+    if code == 'v' or code == 'V'
+        let target = if code == 'v'
+            MODE_VISUAL
+        else
+            MODE_VISUAL_LINE
+        m.reset_pending()
+        if m.mode == target
+            leave_visual(var m)
+        else
+            m.set_mode(target)
+    else if code == 'o' or code == 'O'
+        let l = m.line
+        let c = m.col
+        m.line = m.anchor_line
+        m.col = m.anchor_col
+        m.anchor_line = l
+        m.anchor_col = c
+        m.want = m.col
+        m.reset_pending()
+        m.emit(MoveCursor(line: m.line, col: m.col))
+    else if code == 'x'
+        visual_op(var m, view, OP_DELETE, false)
+    else if code == 'X' or code == 'D'
+        visual_op(var m, view, OP_DELETE, true)
+    else if code == 's'
+        visual_op(var m, view, OP_CHANGE, false)
+    else if code == 'S' or code == 'R' or code == 'C'
+        visual_op(var m, view, OP_CHANGE, true)
+    else if code == 'Y'
+        visual_op(var m, view, OP_YANK, true)
+    else if code == 'u'
+        visual_op(var m, view, OP_LOWER, false)
+    else if code == 'U'
+        visual_op(var m, view, OP_UPPER, false)
+    else if code == '~'
+        visual_op(var m, view, OP_TOGGLE, false)
+    else if code == 'J'
+        visual_join(var m, view, true)
+    else if code == 'p'
+        visual_put(var m, view, false)
+    else if code == 'P'
+        visual_put(var m, view, true)
+    else
+        bell(var m)
+
+// plain_key handles a key that is not the second key of a command.
+fn plain_key<V: TextView>(var m: Modal, view: V, code: Int)
+    let vis = vimmodal.is_visual(m.mode)
+    if code == K_ESC or code == C_C
+        if vis
+            leave_visual(var m)
+        m.reset_pending()
+        return
+    if code == '"'
+        if m.op != OP_NONE
+            bell(var m)
+            return
+        m.prefix = '"'
+        return
+    let opk = op_of(code)
+    if opk != OP_NONE
+        if vis
+            visual_op(var m, view, opk, false)
+        else if m.op == opk
+            line_op(var m, view)
+        else if m.op != OP_NONE
+            bell(var m)
+        else
+            m.op = opk
+        return
+    if m.op != OP_NONE and is_case_op(m.op) and code == doubled_key(m.op)
+        line_op(var m, view)
+        return
+    if code == 'g' or code == 'z' or code == 'f' or code == 'F' or code == 't' or code == 'T' or code == '\'' or code == '`'
+        m.prefix = code
+        return
+    if (code == 'm' or code == 'r') and m.op == OP_NONE and not (vis and code == 'm')
+        m.prefix = code
+        return
+    if (code == 'i' or code == 'a') and (m.op != OP_NONE or vis)
+        m.prefix = code
+        return
+    if is_motion_key(code)
+        do_motion(var m, view, code)
+        return
+    if code == 'n' or code == 'N' or code == '*' or code == '#'
+        search_key(var m, view, code)
+        return
+    if code == '/' or code == '?' or code == ':' and m.op == OP_NONE
+        cmdline_key(var m, view, code)
+        return
+    if m.op != OP_NONE
+        bell(var m)
+        return
+    if vis
+        visual_command(var m, view, code)
+    else
+        normal_command(var m, view, code)
+
+// normal_key handles one key in Normal, Operator-pending or Visual mode.
+pub fn normal_key<V: TextView>(var m: Modal, view: V, code: Int)
+    if m.search_wait
+        m.reset_pending()
+    if m.prefix == 0
+        let current = if m.op != OP_NONE
+            m.op_count
+        else
+            m.count
+        if code >= '1' and code <= '9' or code == '0' and current > 0
+            var v = current * 10 + (code - '0')
+            if v > 99999999
+                v = 99999999
+            if m.op != OP_NONE
+                m.op_count = v
+            else
+                m.count = v
+            return
+    if not (m.prefix == '"' or m.prefix == 0 and code == '"')
+        list.push(m.cmd_keys, code)
+    if m.prefix != 0
+        prefix_key(var m, view, code)
+    else
+        plain_key(var m, view, code)
+
+// handle_key handles one key in any mode.
+pub fn handle_key<V: TextView>(var m: Modal, view: V, code: Int)
+    if code == 0
+        return
+    if m.mode == MODE_INSERT or m.mode == MODE_REPLACE
+        viminsert.insert_key(var m, view, code)
+    else if m.mode == MODE_CMDLINE
+        m.emit(Bell)
+    else
+        normal_key(var m, view, code)
+
+// found_motion is the motion a search ends in: a jump, exclusive, and big
+// for the register.
+fn found_motion(line: Int, col: Int) -> Mv
+    Mv { ok: true, line: line, col: col, linewise: false, inclusive: false,
+         jump: true, big: true, want: WANT_FROM_COL }
+
+// search_done finishes the motion a search was part of.
+pub fn search_done<V: TextView>(var m: Modal, view: V, found: Bool, line: Int, col: Int)
+    if not m.search_wait
+        return
+    m.search_wait = false
+    if not found
+        bell(var m)
+        return
+    finish_motion(var m, view, found_motion(line, col), cur_pos(m))
+
+// begin_search_after_cmdline starts the search a command line asked for.
+pub fn cmdline_finish<V: TextView>(var m: Modal, view: V, text: Str)
+    if m.mode != MODE_CMDLINE
+        return
+    let kind = m.cmdline_kind
+    m.set_mode(m.prev_mode)
+    if kind == CMDLINE_EX
+        m.reset_pending()
+        return
+    let forward = kind == CMDLINE_SEARCH_FORWARD
+    m.search_forward = forward
+    start_search(var m, forward, text, false)
+
+// cmdline_cancel leaves the command line without running it.
+pub fn cmdline_cancel(var m: Modal)
+    if m.mode != MODE_CMDLINE
+        return
+    m.set_mode(m.prev_mode)
+    m.reset_pending()

@@ -1,0 +1,33 @@
+[package]
+name        = "vim-motions-nv"
+version     = "0.1.0"
+description = "The modal editing model of Vim as a state machine with no terminal and no text of its own: one keystroke in, the new mode, count, pending operator, registers, marks and cursor out, and a list of actions for the host to apply to its text. Motions, operators, text objects, Visual mode, the dot repeat and Insert mode, read through a TextView trait the host implements, with the behaviour of Vim and its test vectors checked against a real editor."
+license     = "Apache-2.0"
+
+# `experimental` because no program outside this repository has used the
+# package yet.
+stability   = "experimental"
+
+# `core`: a step is a function of values.  The text is read through the
+# host's `TextView`, the answer is a list of actions, and nothing is read
+# or written beyond that.  There is no device build, because the registers
+# are strings and the actions are a list.
+layer       = "core"
+
+category    = "terminal"
+
+tags        = ["vim", "modal-editing", "motions", "operators", "text-objects", "registers", "dot-repeat", "sans-io", "editor", "keybindings"]
+repository  = "https://github.com/novolang/vim-motions-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.25.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Vim's modal editing model: keys in, actions out"
+
+[dependencies]
+# The key type: a codepoint with modifiers, or a named key, which is what
+# termios-nv's read loop produces.  `core`, so `dep-layer` holds.
+keymap-nv = "^0.2.2"

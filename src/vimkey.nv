@@ -1,0 +1,233 @@
+// vimkey.nv — keystrokes as the number a step works with, and keys written
+// as text.
+//
+// A step reads a `KeyStroke` from keymap-nv: a codepoint with modifiers, or
+// a named key.  Inside the package a key is one number.  A character is its
+// codepoint.  A control character is the control byte a terminal sends for
+// it, so Ctrl and `r` is 18, and Escape, Enter, Tab and Backspace are 27,
+// 13, 9 and 127.  A named key is `KEY_NAMED` plus keymap-nv's number for it.
+// A key with Alt or Meta held is `KEY_ALT` plus its codepoint, and the
+// package has no command bound to one.
+//
+// `keys_of` reads the notation Vim uses for keys in its documentation:
+// plain characters, and names in angle brackets such as `<Esc>`, `<CR>` and
+// `<C-r>`.
+
+use std.list
+use std.str
+use keymodel
+use vimtext
+
+// The first number a named key takes.
+pub const KEY_NAMED = 0x200000
+
+// The bit set on a key pressed with Alt or Meta held.
+pub const KEY_ALT = 0x400000
+
+// Ctrl and `a`, which the package does not bind.
+pub const C_A = 1
+// Ctrl and `b`: back a page.
+pub const C_B = 2
+// Ctrl and `c`: Escape.
+pub const C_C = 3
+// Ctrl and `d`: down half a window.
+pub const C_D = 4
+// Ctrl and `e`: scroll the window down a line.
+pub const C_E = 5
+// Ctrl and `f`: forward a page.
+pub const C_F = 6
+// Ctrl and `h`, which a terminal sends as Backspace.
+pub const C_H = 8
+// Ctrl and `j`: down a line.
+pub const C_J = 10
+// Ctrl and `n`: down a line.
+pub const C_N = 14
+// Ctrl and `p`: up a line.
+pub const C_P = 16
+// Ctrl and `r`: redo, and in Insert mode insert a register.
+pub const C_R = 18
+// Ctrl and `u`: up half a window, and in Insert mode delete back.
+pub const C_U = 21
+// Ctrl and `v`, which starts a block selection that the package refuses.
+pub const C_V = 22
+// Ctrl and `w`: in Insert mode delete the word before the cursor.
+pub const C_W = 23
+// Ctrl and `x`, which the package does not bind.
+pub const C_X = 24
+// Ctrl and `y`: scroll the window up a line.
+pub const C_Y = 25
+
+// Escape.
+pub const K_ESC = 27
+// Enter.
+pub const K_ENTER = 13
+// Tab.
+pub const K_TAB = 9
+// Backspace.
+pub const K_BS = 127
+// The up arrow.
+pub const K_UP = 0x20000C
+// The down arrow.
+pub const K_DOWN = 0x20000D
+// The left arrow.
+pub const K_LEFT = 0x20000E
+// The right arrow.
+pub const K_RIGHT = 0x20000F
+// The Home key.
+pub const K_HOME = 0x200008
+// The End key.
+pub const K_END = 0x200009
+// The Page Up key.
+pub const K_PAGE_UP = 0x20000A
+// The Page Down key.
+pub const K_PAGE_DOWN = 0x20000B
+// The Delete key.
+pub const K_DELETE = 0x200007
+// The Insert key, which the package does not bind.
+pub const K_INSERT = 0x200006
+
+// ctrl is the number of Ctrl and a letter: `ctrl('r')` is 18.
+pub fn ctrl(letter: Int) -> Int
+    if letter >= 'a' and letter <= 'z'
+        letter - 0x60
+    else if letter >= 'A' and letter <= 'Z'
+        letter - 0x40
+    else
+        letter & 0x1F
+
+// key_code is the number a keystroke is read as.  A key release, which only
+// the kitty keyboard protocol reports, answers 0, and so does a key the
+// package has no use for.
+pub fn key_code(k: KeyStroke) -> Int
+    if k.motion == keymodel.KEY_UP_EVENT
+        return 0
+    let p = k.press
+    if p.kind == keymodel.KEY_PRESS_CHAR
+        let cp = p.codepoint
+        if k.mods.alt or k.mods.meta
+            return KEY_ALT + cp
+        if k.mods.ctrl
+            if cp == 'h' or cp == 'H'
+                return K_BS
+            if cp >= 'a' and cp <= 'z' or cp >= 'A' and cp <= 'Z' or cp == '[' or cp == '\\' or cp == ']' or cp == '^' or cp == '_' or cp == '@' or cp == ' '
+                return ctrl(cp)
+            return 0
+        return cp
+    if p.kind == keymodel.KEY_PRESS_NAMED
+        if p.name == keymodel.KEY_ESCAPE
+            return K_ESC
+        if p.name == keymodel.KEY_ENTER
+            return K_ENTER
+        if p.name == keymodel.KEY_TAB
+            return K_TAB
+        if p.name == keymodel.KEY_BACKSPACE
+            return K_BS
+        if k.mods.alt or k.mods.meta or k.mods.ctrl or k.mods.shift
+            return 0
+        return KEY_NAMED + p.name
+    if p.kind == keymodel.KEY_PRESS_PAD
+        if p.pad == keymodel.KEYPAD_DIGIT
+            return '0' + p.number
+        if p.pad == keymodel.KEYPAD_ENTER
+            return K_ENTER
+        if p.pad == keymodel.KEYPAD_PLUS
+            return '+'
+        if p.pad == keymodel.KEYPAD_MINUS
+            return '-'
+        if p.pad == keymodel.KEYPAD_STAR
+            return '*'
+        if p.pad == keymodel.KEYPAD_SLASH
+            return '/'
+        if p.pad == keymodel.KEYPAD_DOT
+            return '.'
+    0
+
+// stroke_of_code is a keystroke that reads as the given number.
+pub fn stroke_of_code(code: Int) -> KeyStroke
+    if code >= KEY_NAMED and code < KEY_ALT
+        keymodel.named_key(code - KEY_NAMED)
+    else if code == K_ESC
+        keymodel.named_key(keymodel.KEY_ESCAPE)
+    else if code == K_ENTER
+        keymodel.named_key(keymodel.KEY_ENTER)
+    else if code == K_TAB
+        keymodel.named_key(keymodel.KEY_TAB)
+    else if code == K_BS
+        keymodel.named_key(keymodel.KEY_BACKSPACE)
+    else if code >= 1 and code <= 26
+        keymodel.ctrl_key(code + 0x60)
+    else
+        keymodel.char_key(code)
+
+// named_code is the number of a key written in angle brackets, or -1 for a
+// name that is not one.
+fn named_code(name: Str) -> Int
+    let n = str.lower(name)
+    if n == "esc"
+        K_ESC
+    else if n == "cr" or n == "enter" or n == "return"
+        K_ENTER
+    else if n == "tab"
+        K_TAB
+    else if n == "bs"
+        K_BS
+    else if n == "space"
+        ' '
+    else if n == "lt"
+        '<'
+    else if n == "bar"
+        '|'
+    else if n == "bslash"
+        '\\'
+    else if n == "del"
+        K_DELETE
+    else if n == "left"
+        K_LEFT
+    else if n == "right"
+        K_RIGHT
+    else if n == "up"
+        K_UP
+    else if n == "down"
+        K_DOWN
+    else if n == "home"
+        K_HOME
+    else if n == "end"
+        K_END
+    else if n == "pageup"
+        K_PAGE_UP
+    else if n == "pagedown"
+        K_PAGE_DOWN
+    else if str.len(n) == 3 and str.starts_with(n, "c-")
+        ctrl(str.byte_at_or(n, 2, 0))
+    else
+        0 - 1
+
+// codes_of reads keys written as text into key numbers.
+pub fn codes_of(s: Str) -> [Int]
+    var out: [Int] = []
+    var first = true
+    for part in str.split(s, "<")
+        // Every part but the first follows a `<`.
+        if first
+            out = [...out, ...vimtext.decode_utf8(part)]
+        else
+            let close = str.index(part, ">") ?? 0 - 1
+            let code = if close > 0 and close <= 10
+                named_code(str.slice(part, 0, close))
+            else
+                0 - 1
+            if code >= 0
+                list.push(out, code)
+                out = [...out, ...vimtext.decode_utf8(str.slice(part, close + 1, str.len(part)))]
+            else
+                list.push(out, '<')
+                out = [...out, ...vimtext.decode_utf8(part)]
+        first = false
+    out
+
+// keys_of reads keys written as text into keystrokes.
+pub fn keys_of(s: Str) -> [KeyStroke]
+    var out: [KeyStroke] = []
+    for code in codes_of(s)
+        list.push(out, stroke_of_code(code))
+    out

@@ -1,0 +1,480 @@
+// vimmodal.nv — the state of Vim's modal editing, and the actions it asks
+// of a host.
+//
+// A `Modal` holds everything Vim remembers between keystrokes that is not
+// text: the mode, the cursor, the count and the operator being typed, the
+// registers, the marks, the last find and search, the record the dot
+// command repeats, and the insert being typed.  A step takes a `Modal`
+// and answers a new one; the one it was given is not changed.
+//
+// The text belongs to the host.  A step answers a list of `Action`
+// values, and the host applies them to its text in the order given.  The
+// places in an action refer to the text as it is after the actions before
+// it in the same list.  The cursor in the answer is the cursor the host
+// should show.
+
+use std.list
+use std.str
+
+// ── Modes ───────────────────────────────────────────────────────────
+
+// Normal mode.
+pub const MODE_NORMAL = 0
+// Insert mode.
+pub const MODE_INSERT = 1
+// Replace mode, entered with `R`.
+pub const MODE_REPLACE = 2
+// Visual mode over characters, entered with `v`.
+pub const MODE_VISUAL = 3
+// Visual mode over whole lines, entered with `V`.
+pub const MODE_VISUAL_LINE = 4
+// Visual mode over a block.  The package refuses `Ctrl-V` and never
+// enters this mode.
+pub const MODE_VISUAL_BLOCK = 5
+// The command line, entered with `:`, `/` or `?`.  The host owns the
+// line being typed and tells the package when it is finished.
+pub const MODE_CMDLINE = 6
+// Normal mode with an operator typed and its motion not yet complete.
+// `mode_of` answers it; the `mode` field never holds it.
+pub const MODE_OP_PENDING = 7
+
+// ── Operators ───────────────────────────────────────────────────────
+
+// No operator is waiting.
+pub const OP_NONE = 0
+// `d`.
+pub const OP_DELETE = 1
+// `c`.
+pub const OP_CHANGE = 2
+// `y`.
+pub const OP_YANK = 3
+// `>`.
+pub const OP_SHIFT_RIGHT = 4
+// `<`.
+pub const OP_SHIFT_LEFT = 5
+// `gu`.
+pub const OP_LOWER = 6
+// `gU`.
+pub const OP_UPPER = 7
+// `g~`.
+pub const OP_TOGGLE = 8
+
+// ── Case changes ────────────────────────────────────────────────────
+
+// The text becomes lower case.
+pub const CASE_LOWER = 0
+// The text becomes upper case.
+pub const CASE_UPPER = 1
+// Lower case becomes upper case and upper case becomes lower case.
+pub const CASE_TOGGLE = 2
+
+// ── Command lines and scrolling ─────────────────────────────────────
+
+// `:`.
+pub const CMDLINE_EX = 0
+// `/`.
+pub const CMDLINE_SEARCH_FORWARD = 1
+// `?`.
+pub const CMDLINE_SEARCH_BACKWARD = 2
+
+// A page scroll forward, `Ctrl-F`.
+pub const SCROLL_PAGE_DOWN = 0
+// A page scroll backward, `Ctrl-B`.
+pub const SCROLL_PAGE_UP = 1
+
+// ── Registers ───────────────────────────────────────────────────────
+
+// The slot of `"0`, which a yank without a register writes.  Slots 1 to 9
+// are `"1` to `"9`.
+pub const SLOT_YANK = 0
+// The slot of `"-`, which a delete within a line writes.
+pub const SLOT_SMALL_DELETE = 10
+// The slot of `"a`; slots 11 to 36 are `"a` to `"z`.
+pub const SLOT_NAMED = 11
+// The number of register slots.
+pub const SLOT_COUNT = 37
+
+// The answer of a register lookup for the black hole register `"_`, which
+// reads as empty and discards what is written to it.
+pub const SLOT_BLACK_HOLE = 0 - 2
+
+// The answer for a name that is not a register.
+pub const SLOT_NONE = 0 - 1
+
+// The `want` of a cursor that stays at the end of its line, as `$` leaves
+// it.
+pub const WANT_END = 0 - 1
+
+// The number of marks held: `a` to `z`, the previous-position mark, and the
+// two ends of the last Visual selection.
+pub const MARK_COUNT = 29
+// The slot of the previous-position mark, `'` and `` ` ``.
+pub const MARK_JUMP = 26
+// The slot of `'<`, the start of the last Visual selection.
+pub const MARK_VISUAL_START = 27
+// The slot of `'>`, the end of the last Visual selection.
+pub const MARK_VISUAL_END = 28
+
+// ── What a step asks the host to do ─────────────────────────────────
+
+// Span is a piece of text.  A characterwise span runs from `line` and
+// `col` up to, and not including, `end_line` and `end_col`.  A linewise
+// span is the whole lines `line` to `end_line` inclusive, and its columns
+// are zero.
+pub @value
+struct Span
+    line: Int
+    col: Int
+    end_line: Int
+    end_col: Int
+    linewise: Bool
+
+impl Span
+    // chars builds a characterwise span.
+    fn chars(line: Int, col: Int, end_line: Int, end_col: Int) -> Span
+        Span { line: line, col: col, end_line: end_line, end_col: end_col, linewise: false }
+
+    // lines builds a linewise span.
+    fn lines(first: Int, last: Int) -> Span
+        Span { line: first, col: 0, end_line: last, end_col: 0, linewise: true }
+
+// Action is one thing the host does to its text or its screen.
+//
+// `Delete` removes a span, and a linewise span removes its lines; a text
+// left with no lines keeps one empty line.  `Insert` puts text at a place,
+// and a newline in the text breaks the line there.  `ReplaceChar` writes
+// one codepoint over `count` characters.  `JoinLines` joins `count` lines
+// from `line` into one, with the blanks that begin each joined line
+// removed and one space put in their place when `spaces` is set, as `J`
+// does, and with the lines run together as they are when it is not, as `gJ`
+// does.  `Indent` and `Dedent` shift the lines `first` to `last` by
+// `levels` shift widths.  `ChangeCase` changes the case of a span.  `Yank`
+// says which span was copied, and changes nothing.  `Put` puts the text of
+// a register: a linewise `Put` inserts its lines before `line`, and a
+// characterwise one inserts at `line` and `col`.  `UndoMark` says that the
+// actions after it belong to a new change, so the host starts a new undo
+// step before applying them; its place is the cursor to put back when the
+// change is undone.  `Search` asks the host to find the `count`th
+// match of a pattern from the cursor, and an empty pattern means the last
+// one; the host answers with `search_found` or `search_failed`.
+// `EnterCommandLine` says that the host should read a command line, and
+// `kind` is one of the `CMDLINE_` numbers.  `ScrollBy` moves the first
+// line of the window by a number of lines, and `ScrollPage` scrolls by
+// pages.  `Bell` says that a key was refused.
+pub enum Action
+    MoveCursor(line: Int, col: Int)
+    Delete(span: Span)
+    Insert(line: Int, col: Int, text: Str)
+    ReplaceChar(line: Int, col: Int, count: Int, ch: Int)
+    JoinLines(line: Int, count: Int, spaces: Bool)
+    Indent(first: Int, last: Int, levels: Int)
+    Dedent(first: Int, last: Int, levels: Int)
+    ChangeCase(span: Span, kind: Int)
+    Yank(span: Span)
+    Put(line: Int, col: Int, text: Str, linewise: Bool)
+    Undo
+    Redo
+    UndoMark(line: Int, col: Int)
+    SetMode(mode: Int)
+    Search(forward: Bool, pattern: Str, whole_word: Bool, count: Int)
+    EnterCommandLine(kind: Int, initial: Str)
+    ScrollBy(lines: Int)
+    ScrollPage(direction: Int, pages: Int)
+    Bell
+
+// Step is the answer to one keystroke: the new state, and the actions for
+// the host.
+pub struct Step
+    modal: Modal
+    actions: [Action]
+
+// Modal is the state of Vim between keystrokes.
+//
+// The fields are public so a host can read them: `mode`, `line` and `col`
+// for the cursor and the status line, `count`, `op` and `reg` for a
+// pending-command display, and the Visual anchor for drawing a selection.
+// A host changes none of them directly.  It tells the package about the
+// world through `vimstep` instead.
+pub struct Modal
+    var mode: Int
+    var line: Int
+    var col: Int
+    var want: Int
+    var count: Int
+    var op: Int
+    var op_count: Int
+    var reg_count: Int
+    var prefix: Int
+    var reg: Int
+    var regs: [Str]
+    var regs_linewise: [Bool]
+    var regs_set: [Bool]
+    var unnamed: Int
+    var marks_line: [Int]
+    var marks_col: [Int]
+    var find_ch: Int
+    var find_kind: Int
+    var search_forward: Bool
+    var search_wait: Bool
+    var cmd_keys: [Int]
+    var dot_keys: [Int]
+    var dot_count: Int
+    var dot_reg: Int
+    var dot_text: [Int]
+    var dot_valid: Bool
+    var replaying: Bool
+    var ins_text: [Int]
+    var ins_count: Int
+    var ins_line: Int
+    var ins_col: Int
+    var ins_orig: [Int]
+    var ins_lead: Int
+    var anchor_line: Int
+    var anchor_col: Int
+    var last_visual_mode: Int
+    var cmdline_kind: Int
+    var prev_mode: Int
+    var nonblank: Bool
+    var out: [Action]
+
+// modal_new is the state of an editor that has just started: Normal mode,
+// the cursor at the start of the text, nothing pending and every register
+// empty.
+pub fn modal_new() -> Modal
+    var marks_line: [Int] = []
+    var marks_col: [Int] = []
+    for i in 0..MARK_COUNT
+        list.push(marks_line, 0 - 1)
+        list.push(marks_col, 0)
+    var regs: [Str] = []
+    var regs_linewise: [Bool] = []
+    var regs_set: [Bool] = []
+    var r = 0
+    while r < SLOT_COUNT
+        list.push(regs, "")
+        list.push(regs_linewise, false)
+        list.push(regs_set, false)
+        r = r + 1
+    Modal { mode: MODE_NORMAL, line: 0, col: 0, want: 0, count: 0, op: OP_NONE,
+            op_count: 0, reg_count: 0, prefix: 0, reg: 0, regs: regs,
+            regs_linewise: regs_linewise, regs_set: regs_set,
+            unnamed: SLOT_NONE, marks_line: marks_line, marks_col: marks_col,
+            find_ch: 0, find_kind: 0, search_forward: true, search_wait: false,
+            cmd_keys: [], dot_keys: [], dot_count: 0, dot_reg: 0, dot_text: [],
+            dot_valid: false, replaying: false, ins_text: [], ins_count: 1,
+            ins_line: 0, ins_col: 0, ins_orig: [], ins_lead: 0, anchor_line: 0,
+            anchor_col: 0, last_visual_mode: MODE_VISUAL, cmdline_kind: 0,
+            prev_mode: MODE_NORMAL, nonblank: false, out: [] }
+
+// modal_clone is a copy of a state that shares nothing with it.
+pub fn modal_clone(m: Modal) -> Modal
+    Modal { mode: m.mode, line: m.line, col: m.col, want: m.want,
+            count: m.count, op: m.op, op_count: m.op_count,
+            reg_count: m.reg_count,
+            prefix: m.prefix, reg: m.reg, regs: list.clone(m.regs),
+            regs_linewise: list.clone(m.regs_linewise),
+            regs_set: list.clone(m.regs_set), unnamed: m.unnamed,
+            marks_line: list.clone(m.marks_line),
+            marks_col: list.clone(m.marks_col), find_ch: m.find_ch,
+            find_kind: m.find_kind, search_forward: m.search_forward,
+            search_wait: m.search_wait, cmd_keys: list.clone(m.cmd_keys),
+            dot_keys: list.clone(m.dot_keys), dot_count: m.dot_count,
+            dot_reg: m.dot_reg, dot_text: list.clone(m.dot_text),
+            dot_valid: m.dot_valid, replaying: m.replaying,
+            ins_text: list.clone(m.ins_text), ins_count: m.ins_count,
+            ins_line: m.ins_line, ins_col: m.ins_col,
+            ins_orig: list.clone(m.ins_orig), ins_lead: m.ins_lead,
+            anchor_line: m.anchor_line,
+            anchor_col: m.anchor_col, last_visual_mode: m.last_visual_mode,
+            cmdline_kind: m.cmdline_kind, prev_mode: m.prev_mode,
+            nonblank: m.nonblank, out: [] }
+
+// is_visual says whether a mode is one of the Visual modes.
+pub fn is_visual(mode: Int) -> Bool
+    mode == MODE_VISUAL or mode == MODE_VISUAL_LINE or mode == MODE_VISUAL_BLOCK
+
+// mark_slot is the slot of a mark name: `a` to `z`, `'` and `` ` `` for the
+// previous position, and `<` and `>` for the ends of the last Visual
+// selection.  Any other name answers -1.
+pub fn mark_slot(name: Int) -> Int
+    if name >= 'a' and name <= 'z'
+        name - 'a'
+    else if name == '\'' or name == '`'
+        MARK_JUMP
+    else if name == '<'
+        MARK_VISUAL_START
+    else if name == '>'
+        MARK_VISUAL_END
+    else
+        0 - 1
+
+// reg_name_slot is the slot of a register name that does not depend on the
+// state: `0` to `9`, `-`, `a` to `z` and `A` to `Z`, which name the same
+// slots as the lower case.  `_` answers `SLOT_BLACK_HOLE` and any other name
+// `SLOT_NONE`.  `"` is the register the last write went to and is
+// `Modal.reg_slot`.
+pub fn reg_name_slot(name: Int) -> Int
+    if name >= '0' and name <= '9'
+        name - '0'
+    else if name == '-'
+        SLOT_SMALL_DELETE
+    else if name >= 'a' and name <= 'z'
+        SLOT_NAMED + (name - 'a')
+    else if name >= 'A' and name <= 'Z'
+        SLOT_NAMED + (name - 'A')
+    else if name == '_'
+        SLOT_BLACK_HOLE
+    else
+        SLOT_NONE
+
+impl Modal
+    // mode_of is the mode a status line shows: the mode, or
+    // `MODE_OP_PENDING` while an operator or a prefix key waits for the
+    // rest of its command.
+    fn mode_of(self) -> Int
+        if self.mode == MODE_NORMAL and (self.op != OP_NONE or self.prefix != 0)
+            MODE_OP_PENDING
+        else
+            self.mode
+
+    // reg_slot is the slot of a register name, with `"` standing for the
+    // register the last write went to.
+    fn reg_slot(self, name: Int) -> Int
+        if name == '"'
+            self.unnamed
+        else
+            reg_name_slot(name)
+
+    // reg_text is the text a register holds, with a newline between the
+    // lines of a linewise register and none after the last.  A name that is
+    // not a register, and a register never written, hold the empty string.
+    fn reg_text(self, name: Int) -> Str
+        let s = self.reg_slot(name)
+        if s < 0
+            ""
+        else
+            self.regs[s]
+
+    // reg_is_linewise says whether a register holds whole lines.
+    fn reg_is_linewise(self, name: Int) -> Bool
+        let s = self.reg_slot(name)
+        if s < 0
+            false
+        else
+            self.regs_linewise[s]
+
+    // mark_is_set says whether a mark holds a place.
+    fn mark_is_set(self, slot: Int) -> Bool
+        self.marks_line[slot] >= 0
+
+    // marks_remove_lines forgets the marks on lines that were deleted and
+    // moves the marks below them up.
+    fn marks_remove_lines(var self, first: Int, last: Int)
+        for i in 0..MARK_COUNT
+            let l = self.marks_line[i]
+            if l >= first and l <= last
+                self.marks_line[i] = 0 - 1
+            else if l > last
+                self.marks_line[i] = l - (last - first + 1)
+
+    // marks_add_lines moves the marks at and below a line down, for lines
+    // that were inserted before it.
+    fn marks_add_lines(var self, at: Int, n: Int)
+        for i in 0..MARK_COUNT
+            if self.marks_line[i] >= at
+                self.marks_line[i] = self.marks_line[i] + n
+
+    // mark_set records a place under a mark slot.
+    fn mark_set(var self, slot: Int, line: Int, col: Int)
+        self.marks_line[slot] = line
+        self.marks_col[slot] = col
+
+    // emit adds an action to the list the current step answers.
+    fn emit(var self, a: Action)
+        list.push(self.out, a)
+
+    // set_mode changes the mode and tells the host.
+    fn set_mode(var self, mode: Int)
+        if self.mode != mode
+            self.mode = mode
+            self.emit(SetMode(mode: mode))
+
+    // begin_change tells the host that a change starts, so it can begin an
+    // undo step before it applies the actions that follow.
+    fn begin_change(var self)
+        self.emit(UndoMark(line: self.line, col: self.col))
+
+    // reset_pending forgets the count, the operator, the prefix key, the
+    // register choice and the keys of the command being typed.
+    fn reset_pending(var self)
+        self.count = 0
+        self.op_count = 0
+        self.reg_count = 0
+        self.op = OP_NONE
+        self.prefix = 0
+        self.reg = 0
+        self.search_wait = false
+        self.cmd_keys = []
+
+    // place puts the cursor at a place and makes the column the wanted one.
+    fn place(var self, line: Int, col: Int)
+        self.line = line
+        self.col = col
+        self.want = col
+        self.nonblank = false
+
+    // reg_store writes a slot.  An append to a register that holds text adds
+    // the new text on a line of its own when either side is linewise.
+    fn reg_store(var self, slot: Int, text: Str, linewise: Bool, append: Bool)
+        if append and self.regs_set[slot]
+            let sep = if str.len(self.regs[slot]) > 0 and (self.regs_linewise[slot] or linewise)
+                "\n"
+            else
+                ""
+            self.regs[slot] = self.regs[slot] + sep + text
+            self.regs_linewise[slot] = self.regs_linewise[slot] or linewise
+        else
+            self.regs[slot] = text
+            self.regs_linewise[slot] = linewise
+        self.regs_set[slot] = true
+
+    // reg_write_yank records yanked text.  It goes to the register named
+    // with `"x` when there is one, and otherwise to `"0`.  The unnamed
+    // register then refers to it.
+    fn reg_write_yank(var self, text: Str, linewise: Bool)
+        if self.reg == '_'
+            return
+        let name = self.reg
+        var slot = SLOT_YANK
+        if name != 0 and self.reg_slot(name) >= 0
+            slot = self.reg_slot(name)
+        self.reg_store(slot, text, linewise, name >= 'A' and name <= 'Z')
+        self.unnamed = slot
+
+    // reg_write_delete records deleted text.  With a register named it goes
+    // there.  Otherwise a deletion of a line or more shifts `"1` to `"9`,
+    // and a smaller one goes to `"-`.  `big` forces the first, as the
+    // motions `%`, `(`, `)`, `` ` ``, `/`, `?`, `n`, `N`, `{` and `}` do.
+    // The unnamed register then refers to what was written.
+    fn reg_write_delete(var self, text: Str, linewise: Bool, big: Bool)
+        if self.reg == '_'
+            return
+        let name = self.reg
+        let named = name != 0 and self.reg_slot(name) >= 0
+        if named
+            let slot = self.reg_slot(name)
+            self.reg_store(slot, text, linewise, name >= 'A' and name <= 'Z')
+            self.unnamed = slot
+        let within_line = not linewise and not str.contains(text, "\n")
+        if linewise or big or not within_line
+            var i = 9
+            while i > 1
+                self.regs[i] = self.regs[i - 1]
+                self.regs_linewise[i] = self.regs_linewise[i - 1]
+                self.regs_set[i] = self.regs_set[i - 1]
+                i = i - 1
+            self.reg_store(1, text, linewise, false)
+            self.unnamed = 1
+        if within_line and not named
+            self.reg_store(SLOT_SMALL_DELETE, text, false, false)
+            self.unnamed = SLOT_SMALL_DELETE

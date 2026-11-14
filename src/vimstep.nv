@@ -1,0 +1,106 @@
+// vimstep.nv — the entry points: a keystroke in, a new state and a list of
+// actions out.
+//
+// A host reads the text it keeps through a `TextView`, calls `step` with a
+// keystroke, applies the actions it answers in order, and calls `settle`
+// with the changed text.  `settle` brings the cursor inside the text and
+// finds the columns that depend on it, such as the first non-blank
+// character of a line that has just been shifted.  `step` calls it first
+// on the text it is given, so a host that does not read the cursor between
+// keys need not call it.
+//
+// The searches and the command line are the host's.  A `Search` action
+// is answered with `search_found` or `search_failed`, and an
+// `EnterCommandLine` action with `cmdline_finish` or `cmdline_cancel`.
+
+use keymodel
+use vimtext
+use vimmodal
+use vimkey
+use vimnormal
+
+// settle_in brings the cursor inside the text the way the mode keeps it,
+// and finds the first non-blank column when a command asked for it.
+fn settle_in<V: TextView>(var m: Modal, view: V)
+    if m.mode == MODE_INSERT or m.mode == MODE_REPLACE or m.mode == MODE_VISUAL
+        let p = view.clamp_insert(vimtext.pos_new(m.line, m.col))
+        m.line = p.line
+        m.col = p.col
+    else
+        let p = view.clamp_normal(vimtext.pos_new(m.line, m.col))
+        m.line = p.line
+        m.col = p.col
+        if m.nonblank
+            m.col = view.first_nonblank(m.line)
+            m.want = m.col
+    m.nonblank = false
+
+// finish takes the actions out of a working state and builds the answer.
+fn finish(var n: Modal) -> Step
+    let acts = n.out
+    n.out = []
+    Step { modal: n, actions: acts }
+
+// settle is the state with its cursor brought inside the text.  A host
+// calls it after it has applied the actions of a step.
+pub fn settle<V: TextView>(m: Modal, view: V) -> Modal
+    var n = vimmodal.modal_clone(m)
+    settle_in(var n, view)
+    n
+
+// step is the state after a keystroke, and the actions the host applies.
+//
+// The state it was given is not changed.  A key release and a key the
+// package has no use for answer the same state and no actions.
+pub fn step<V: TextView>(m: Modal, view: V, key: KeyStroke) -> Step
+    var n = vimmodal.modal_clone(m)
+    settle_in(var n, view)
+    vimnormal.handle_key(var n, view, vimkey.key_code(key))
+    finish(var n)
+
+// step_code is `step` for a key given as the number the package reads, which
+// `vimkey.codes_of` makes from keys written in text.
+pub fn step_code<V: TextView>(m: Modal, view: V, code: Int) -> Step
+    var n = vimmodal.modal_clone(m)
+    settle_in(var n, view)
+    vimnormal.handle_key(var n, view, code)
+    finish(var n)
+
+// search_found tells the package where a search ended.  The cursor moves
+// there, or the pending operator works up to there.
+pub fn search_found<V: TextView>(m: Modal, view: V, line: Int, col: Int) -> Step
+    var n = vimmodal.modal_clone(m)
+    settle_in(var n, view)
+    vimnormal.search_done(var n, view, true, line, col)
+    finish(var n)
+
+// search_failed tells the package that a search found nothing.
+pub fn search_failed<V: TextView>(m: Modal, view: V) -> Step
+    var n = vimmodal.modal_clone(m)
+    vimnormal.search_done(var n, view, false, 0, 0)
+    finish(var n)
+
+// cmdline_done tells the package that the command line the host read is
+// finished.  The text is the search pattern for `/` and `?` and is not used
+// for `:`, whose command the host runs itself.
+pub fn cmdline_done<V: TextView>(m: Modal, view: V, text: Str) -> Step
+    var n = vimmodal.modal_clone(m)
+    vimnormal.cmdline_finish(var n, view, text)
+    finish(var n)
+
+// cmdline_abort tells the package that the command line was left with Escape.
+pub fn cmdline_abort(m: Modal) -> Step
+    var n = vimmodal.modal_clone(m)
+    vimnormal.cmdline_cancel(var n)
+    finish(var n)
+
+// set_cursor moves the cursor to a place the host chose, as it does after an
+// undo or a redo.
+pub fn set_cursor<V: TextView>(m: Modal, view: V, line: Int, col: Int) -> Modal
+    var n = vimmodal.modal_clone(m)
+    n.line = line
+    n.col = col
+    n.want = col
+    n.nonblank = false
+    settle_in(var n, view)
+    n

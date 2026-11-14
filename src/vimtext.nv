@@ -1,0 +1,267 @@
+// vimtext.nv — the text a step reads, and the classes of its characters.
+//
+// The package owns no text.  A host implements `TextView` over whatever
+// holds its lines, and every function that reads text takes one.  A
+// position is a line and a column, both counted from zero, and the column
+// counts codepoints.  A column equal to the length of its line names the
+// place after the last character, which Insert mode and the end of an
+// operator's range use and Normal mode never does.
+//
+// Characters fall in three classes, as Vim's `iskeyword` default of
+// `@,48-57,_,192-255` has them.  A blank is a space or a tab.  A keyword
+// character is a letter, a digit, an underscore, a codepoint from 192 to
+// 255 and any codepoint above 255 that is not punctuation.  Everything else
+// is punctuation.  The end of a line is read as a blank.
+
+use std.list
+use std.str
+
+// TextView is the text a step reads, and the window it is shown in.
+//
+// A host implements the five methods without a body.  `char_at` answers the
+// codepoint at a line and column.  The window is described by its first
+// line and its height in lines; they decide `H`, `M`, `L`, `Ctrl-E`,
+// `Ctrl-Y`, `Ctrl-D`, `Ctrl-U`, `Ctrl-F` and `Ctrl-B`, and nothing else.
+// The other methods are built from those five and are the questions the
+// package asks of a text.
+pub trait TextView
+    fn line_count(self) -> Int
+    fn line_len(self, line: Int) -> Int
+    fn char_at(self, line: Int, col: Int) -> Int
+    fn top_line(self) -> Int
+    fn height(self) -> Int
+
+    // last_line is the index of the last line, never below zero.
+    fn last_line(self) -> Int
+        let n = self.line_count()
+        if n < 1
+            0
+        else
+            n - 1
+
+    // len_at is the length of a line, zero for a line that does not exist.
+    fn len_at(self, line: Int) -> Int
+        if line < 0 or line >= self.line_count()
+            0
+        else
+            self.line_len(line)
+
+    // ch is the codepoint at a place, or `NO_CHAR` outside the text.
+    fn ch(self, line: Int, col: Int) -> Int
+        if line < 0 or line >= self.line_count() or col < 0 or col >= self.line_len(line)
+            0 - 1
+        else
+            self.char_at(line, col)
+
+    // cls_at is the class of the character at a place.  The end of a line
+    // and a line that does not exist are blank.
+    fn cls_at(self, line: Int, col: Int, big: Bool) -> Int
+        vimtext.char_class(self.ch(line, col), big)
+
+    // first_nonblank_raw is the column of the first character that is not a
+    // blank, or the length of the line when there is none.
+    fn first_nonblank_raw(self, line: Int) -> Int
+        let n = self.len_at(line)
+        var i = 0
+        while i < n and vimtext.is_blank(self.char_at(line, i))
+            i = i + 1
+        i
+
+    // first_nonblank is the column of the first character that is not a
+    // blank, or the last column when the line is all blanks, or zero when it
+    // is empty.
+    fn first_nonblank(self, line: Int) -> Int
+        let n = self.len_at(line)
+        let i = self.first_nonblank_raw(line)
+        if i >= n
+            if n > 0
+                n - 1
+            else
+                0
+        else
+            i
+
+    // last_nonblank is the column of the last character that is not a blank,
+    // or zero when there is none.
+    fn last_nonblank(self, line: Int) -> Int
+        var i = self.len_at(line) - 1
+        while i > 0 and vimtext.is_blank(self.char_at(line, i))
+            i = i - 1
+        if i < 0
+            0
+        else
+            i
+
+    // clamp_normal brings a place inside the text the way Normal mode keeps
+    // its cursor: on a character, or at column zero of an empty line.
+    fn clamp_normal(self, p: Pos) -> Pos
+        var l = p.line
+        if l > self.last_line()
+            l = self.last_line()
+        if l < 0
+            l = 0
+        let n = self.len_at(l)
+        var c = p.col
+        if c > n - 1
+            c = n - 1
+        if c < 0
+            c = 0
+        Pos { line: l, col: c }
+
+    // clamp_insert brings a place inside the text the way Insert mode keeps
+    // its cursor: on a character or just after the last one.
+    fn clamp_insert(self, p: Pos) -> Pos
+        var l = p.line
+        if l > self.last_line()
+            l = self.last_line()
+        if l < 0
+            l = 0
+        let n = self.len_at(l)
+        var c = p.col
+        if c > n
+            c = n
+        if c < 0
+            c = 0
+        Pos { line: l, col: c }
+
+    // text_between reads the text from `a` up to but not including `b`, with
+    // a newline between lines.  Both places are inside the text, and `a` is
+    // not after `b`.
+    fn text_between(self, a: Pos, b: Pos) -> Str
+        var cps: [Int] = []
+        var l = a.line
+        var c = a.col
+        while l < b.line or l == b.line and c < b.col
+            let n = self.len_at(l)
+            if c < n
+                list.push(cps, self.char_at(l, c))
+                c = c + 1
+            else
+                list.push(cps, '\n')
+                l = l + 1
+                c = 0
+        vimtext.encode_utf8(cps)
+
+    // lines_text reads the lines `first` to `last` inclusive, joined by
+    // newlines with none after the last.
+    fn lines_text(self, first: Int, last: Int) -> Str
+        var cps: [Int] = []
+        var l = first
+        while l <= last
+            if l > first
+                list.push(cps, '\n')
+            let n = self.len_at(l)
+            var c = 0
+            while c < n
+                list.push(cps, self.char_at(l, c))
+                c = c + 1
+            l = l + 1
+        vimtext.encode_utf8(cps)
+
+// Pos is a place in the text.
+pub @value
+struct Pos
+    line: Int
+    col: Int
+
+// The class of a blank, and of the end of a line.
+pub const CLASS_BLANK = 0
+// The class of a punctuation character.
+pub const CLASS_PUNCT = 1
+// The class of a keyword character.
+pub const CLASS_WORD = 2
+
+// The codepoint `TextView.ch` answers outside the text.
+pub const NO_CHAR = 0 - 1
+
+// pos_new builds a position.
+pub fn pos_new(line: Int, col: Int) -> Pos
+    Pos { line: line, col: col }
+
+// pos_before says whether `a` is earlier in the text than `b`.
+pub fn pos_before(a: Pos, b: Pos) -> Bool
+    a.line < b.line or a.line == b.line and a.col < b.col
+
+// is_blank says whether a codepoint is a space or a tab.
+pub fn is_blank(c: Int) -> Bool
+    c == ' ' or c == '\t'
+
+// is_word_char says whether a codepoint is a keyword character.
+pub fn is_word_char(c: Int) -> Bool
+    if c < 0
+        false
+    else if c < 128
+        c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c >= '0' and c <= '9' or c == '_'
+    else if c < 192
+        false
+    else if c < 256
+        true
+    else if c >= 0x2000 and c <= 0x206F or c >= 0x3000 and c <= 0x303F
+        false
+    else
+        true
+
+// char_class is the class of a codepoint.  With `big` set, which is the
+// WORD reading, every character that is not blank is one class.
+pub fn char_class(c: Int, big: Bool) -> Int
+    if c < 0 or c == ' ' or c == '\t' or c == 0
+        CLASS_BLANK
+    else if big
+        CLASS_PUNCT
+    else if is_word_char(c)
+        CLASS_WORD
+    else
+        CLASS_PUNCT
+
+// ── Codepoints and text ─────────────────────────────────────────────
+
+// decode_utf8 reads a string as codepoints.  A byte that does not begin a
+// well-formed sequence is read as the codepoint of that byte.
+pub fn decode_utf8(s: Str) -> [Int]
+    var out: [Int] = []
+    let n = str.len(s)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        var need = 0
+        var cp = b
+        if b >= 0xF0 and b < 0xF8
+            need = 3
+            cp = b & 0x07
+        else if b >= 0xE0
+            need = 2
+            cp = b & 0x0F
+        else if b >= 0xC0
+            need = 1
+            cp = b & 0x1F
+        if need > 0 and continuation_ok(s, i, need)
+            var k = 1
+            while k <= need
+                cp = (cp << 6) | (str.byte_at_or(s, i + k, 0) & 0x3F)
+                k = k + 1
+            list.push(out, cp)
+            i = i + need + 1
+        else
+            list.push(out, b)
+            i = i + 1
+    out
+
+// continuation_ok says whether `need` continuation bytes follow position
+// `i`.
+fn continuation_ok(s: Str, i: Int, need: Int) -> Bool
+    let n = str.len(s)
+    var k = 1
+    while k <= need
+        if i + k >= n
+            return false
+        if (str.byte_at_or(s, i + k, 0) & 0xC0) != 0x80
+            return false
+        k = k + 1
+    true
+
+// encode_utf8 writes codepoints as a string.
+pub fn encode_utf8(cps: [Int]) -> Str
+    var out = ""
+    for c in cps
+        out = out + str.from_char(c)
+    out
