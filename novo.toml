@@ -1,6 +1,6 @@
 [package]
 name        = "vim-motions-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "The modal editing model of Vim as a state machine with no terminal and no text of its own: one keystroke in, the new mode, count, pending operator, registers, marks and cursor out, and a list of actions for the host to apply to its text. Motions, operators, text objects, Visual mode, the dot repeat and Insert mode, read through a TextView trait the host implements, with the behaviour of Vim and its test vectors checked against a real editor."
 license     = "Apache-2.0"
 
@@ -22,7 +22,9 @@ maintainers = ["novo-lang"]
 novo        = ">= 0.25.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
-# effect-checks every module under `src/` and writes no binary.
+# effect-checks the modules `src/vimcheck.nv` names and writes no binary.
+# `vimram` is not among them, because a program that does not name it is
+# built without it; the test suites name it and check it.
 
 [docs.pages]
 "README.md" = "Vim's modal editing model: keys in, actions out"

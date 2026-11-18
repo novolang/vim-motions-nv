@@ -61,7 +61,8 @@ novo pkg add vim-motions-nv
 The module `vimram` is a text in memory that applies the actions of a step.
 A program with no text store of its own can use it, and the tests use it to
 run keys against a text. Keys are written the way Vim's documentation writes
-them.
+them. A program that does not name `vimram` is built without it, and the
+module's 74 KB of code does not reach the binary.
 
 ```novo
 use std.list
@@ -84,8 +85,9 @@ The output is `world`, `second line!`, `third` and then `1,11 0`: line 1,
 column 11, Normal mode.
 
 A program with a terminal reads keys, steps, applies the actions to its text
-and draws. This is its loop, with the drawing left out. It is marked
-`ignore` because it needs a terminal.
+and draws. This is its loop, with the drawing left out. It changes the
+state in place with `step_mut`, which copies nothing. It is marked `ignore`
+because it needs a terminal.
 
 ```novo ignore
 use keydecode
@@ -95,20 +97,18 @@ use vimstep
 use vimram
 
 // handle feeds the keys one read produced to the editor model.
-fn handle(var doc: Doc, m0: Modal, step: tioinput.TioInputStep) -> Modal
-    var m = m0
+fn handle(var doc: Doc, var m: Modal, step: tioinput.TioInputStep)
     for ev in step.events
         match ev
             TioKeyEvent(e) =>
                 if e.kind == keydecode.KEY_EVENT_PRESSED
-                    let s = vimstep.step(m, doc, e.stroke)
+                    let acts = vimstep.step_mut(var m, doc, e.stroke)
                     // Apply the actions in order, then let the model
                     // find the columns that depend on the new text.
-                    m = vimram.apply_actions(var doc, s.modal, s.actions)
-                    m = vimstep.settle(m, doc)
+                    m = vimram.apply_actions(var doc, m, acts)
+                    vimstep.settle_mut(var m, doc)
             TioReplyEvent(r) =>
                 continue
-    m
 ```
 
 Each frame, the host writes `doc_lines(doc)` and the cursor `m.line`,
@@ -120,23 +120,36 @@ own text type implements `TextView` for it and applies the actions itself.
 
 | Module | Contents |
 | --- | --- |
-| `vimstep` | The entry points: `step`, `settle`, the answers to a search and to a command line, and `set_cursor`. |
+| `vimstep` | The entry points: `step`, `settle`, the answers to a search and to a command line, and `set_cursor`, each in a plain form and in a `_mut` form that changes the state in place. |
 | `vimmodal` | The state (`Modal`), the actions (`Action`, `Span`, `Step`), the mode, operator and register numbers, and the registers and marks. |
 | `vimtext` | `TextView`, `Pos`, the character classes and the reading of UTF-8. |
 | `vimkey` | A keystroke as a number, and keys written as text. |
-| `vimram` | A text in memory that applies actions, keeps an undo stack and answers searches. |
+| `vimram` | A text in memory that applies actions, keeps an undo stack and answers searches. A program is built with it only when the program names it. |
 | `vimmotion` | The motions as functions of a text and a place. |
 | `vimobject` | The text objects of a word, a paragraph, a block and a quoted string. |
 | `vimedit` | What an operator does to a range, and `x`, `p`, `J`, `r`, `~`, `o`. |
 | `viminsert` | Insert mode and Replace mode. |
 | `vimnormal` | Normal, Operator-pending and Visual mode: the key loop. |
 | `vimscroll` | `Ctrl-E`, `Ctrl-Y`, `Ctrl-D`, `Ctrl-U`, `Ctrl-F`, `Ctrl-B`, `zt`, `zz` and `zb`. |
+| `vimcheck` | No code. It names the modules above so that `novo pkg build` checks them all; `vimram` is left out on purpose, and the test suites check it. |
 
 ## How to choose an entry point
 
-**`vimstep.step` takes a keystroke.** It is what a program with a terminal
-uses. `vimstep.step_code` takes the number `vimkey.key_code` makes from a
-keystroke, for a program that already holds keys as numbers.
+**`vimstep.step_mut` takes a keystroke and changes the state it is given.**
+It is what a program with a terminal uses, and it answers the list of
+actions alone. `vimstep.step_code_mut` takes the number `vimkey.key_code`
+makes from a keystroke, for a program that already holds keys as numbers.
+
+**`vimstep.step` and `vimstep.step_code` answer a new state** and leave the
+one they were given as it was. They copy the state first, which a key costs
+a copy of the registers, the marks and the dot record (about 16,000
+instructions on a 20,000-line text), where `step_mut` costs about 1,500. Use
+them where the old state is wanted afterwards, as in a test.
+
+Every other entry point has the same two forms: `settle` and `settle_mut`,
+`set_cursor` and `set_cursor_mut`, `search_found` and `search_found_mut`,
+`search_failed` and `search_failed_mut`, `cmdline_done` and
+`cmdline_done_mut`, `cmdline_abort` and `cmdline_abort_mut`.
 
 **`vimram.run` takes keys written as text** and applies each step to a
 `Doc`. Use it in tests and for scripted editing.
@@ -147,8 +160,11 @@ program that wants Vim's `w` or `ip` without the rest calls them directly.
 
 ## The rules a user needs
 
-1. A step does not change the state it was given. It answers a new one and a
-   list of actions.
+1. A plain step does not change the state it was given. It answers a new
+   one and a list of actions. A `_mut` step changes the state in place and
+   answers the list. A state is shared by every name that holds it, so a host
+   that wants the state as it was before a `_mut` step makes a copy first with
+   `vimmodal.modal_clone`.
 2. The places in an action refer to the text as it is after the actions
    before it in the same list. The host applies them in order.
 3. After applying the actions, the host calls `vimstep.settle` with the
@@ -160,8 +176,14 @@ program that wants Vim's `w` or `ip` without the rest calls them directly.
    span is whole lines, first to last. `Delete` of a linewise span leaves
    one empty line when it takes every line.
 5. `UndoMark` begins an undo step. An insert, from `i` to `Esc`, is one
-   step. `Undo` and `Redo` are for the host to carry out. It then calls
-   `vimstep.set_cursor` with the place it chose.
+   step. Its place is the cursor to put back when the step is undone.
+   `Undo` and `Redo` are for the host to carry out. It then calls
+   `vimstep.set_cursor` with the place it chose. A redo needs the cursor the
+   key was typed at, and `Modal.key_line` and `Modal.key_col` hold it after
+   every step, in the plain form and in the `_mut` form alike: the cursor
+   after it was brought inside the text, which is the place an `UndoMark` of
+   that key names. A host that keeps a redo stack stores the pair beside the
+   change at the `Undo` action and uses it at the `Redo` action.
 6. A `Search` action asks the host to find the `count`th match of the
    pattern from the cursor. An empty pattern is the last one. The host
    answers with `vimstep.search_found` or `vimstep.search_failed`. The
@@ -185,6 +207,11 @@ program that wants Vim's `w` or `ip` without the rest calls them directly.
     they are.
 12. The registers are in the state: `reg_text` and `reg_is_linewise` read
     them, and `Yank` is only the range, for highlighting.
+13. `Modal.reset_pending` forgets the count, the operator, the prefix key
+    such as the `g` of `gg`, the register choice and the keys of the command
+    being typed, with no key. A host calls it when it ends a command itself:
+    when its own key map takes the next key, or when a timeout abandons a
+    prefix. The mode, the cursor, the registers and the dot record stay.
 
 ## What is not Vim
 
@@ -253,8 +280,10 @@ produced by running the same keys in Neovim 0.12 with the options above, one
 fresh editor for each vector: `tests/oracle/*.lua` lists the vectors and
 `bash tests/oracle/regen.sh` writes the suites again. Other suites check the
 rest of the surface, the cursor staying inside the text after any key of a
-fixed random sequence, and every line of `src/`: `bash tests/coverage.sh`
-measures 100 percent.
+fixed random sequence, the `_mut` entry points against the plain ones, and
+every line of `src/`: `bash tests/coverage.sh` measures 100 percent.
+`bash tests/consumer_size.sh` builds two programs against the package and
+checks that the one that does not name `vimram` has no code of it.
 
 Build and test with `novo pkg build` and `novo test`.
 

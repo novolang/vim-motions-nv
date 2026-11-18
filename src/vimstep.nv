@@ -9,9 +9,18 @@
 // on the text it is given, so a host that does not read the cursor between
 // keys need not call it.
 //
+// Each entry point has two forms.  The plain form takes the state as a
+// value and answers a new one, and the state it was given is not changed.
+// The `_mut` form takes the state as `var`, changes it in place and answers
+// the actions alone; it costs no copy of the registers, the marks and the
+// dot record, which is what a key costs in the plain form.  A host that
+// calls `step_mut` has no old state left to read the cursor from, so
+// `Modal.key_line` and `Modal.key_col` hold the cursor the key was typed
+// at.
+//
 // The searches and the command line are the host's.  A `Search` action
 // is answered with `search_found` or `search_failed`, and an
-// `EnterCommandLine` action with `cmdline_finish` or `cmdline_cancel`.
+// `EnterCommandLine` action with `cmdline_done` or `cmdline_abort`.
 
 use keymodel
 use vimtext
@@ -19,9 +28,23 @@ use vimmodal
 use vimkey
 use vimnormal
 
-// settle_in brings the cursor inside the text the way the mode keeps it,
-// and finds the first non-blank column when a command asked for it.
-fn settle_in<V: TextView>(var m: Modal, view: V)
+// The text in memory of `vimram` is for tests and for a program with no text
+// store of its own.  Nothing in this package calls it, and a program that
+// names `vimstep` or `vimmodal` has no use for the 74 KB its instances of
+// the key loop for `Doc` take.  The `use` below stands behind a condition
+// that is false, so a program that does not name `vimram` itself is built
+// without the module (SPEC section 9.6, the dead-module rule), and a program
+// that does name it gets it as before.
+const RAM_TEXT_IN_EVERY_PROGRAM = false
+
+@when(RAM_TEXT_IN_EVERY_PROGRAM)
+use vimram
+
+// settle_mut brings the cursor of a state inside the text the way the mode
+// keeps it, and finds the first non-blank column when a command asked for
+// it.  The state is changed in place.  A host calls it after it has applied
+// the actions of a step.
+pub fn settle_mut<V: TextView>(var m: Modal, view: V)
     if m.mode == MODE_INSERT or m.mode == MODE_REPLACE or m.mode == MODE_VISUAL
         let p = view.clamp_insert(vimtext.pos_new(m.line, m.col))
         m.line = p.line
@@ -35,18 +58,36 @@ fn settle_in<V: TextView>(var m: Modal, view: V)
             m.want = m.col
     m.nonblank = false
 
-// finish takes the actions out of a working state and builds the answer.
-fn finish(var n: Modal) -> Step
+// take_actions moves the actions out of a working state, so the next step
+// starts with none.
+fn take_actions(var n: Modal) -> [Action]
     let acts = n.out
     n.out = []
-    Step { modal: n, actions: acts }
+    acts
 
 // settle is the state with its cursor brought inside the text.  A host
 // calls it after it has applied the actions of a step.
 pub fn settle<V: TextView>(m: Modal, view: V) -> Modal
     var n = vimmodal.modal_clone(m)
-    settle_in(var n, view)
+    settle_mut(var n, view)
     n
+
+// step_code_mut is `step_mut` for a key given as the number the package
+// reads, which `vimkey.codes_of` makes from keys written in text.
+pub fn step_code_mut<V: TextView>(var m: Modal, view: V, code: Int) -> [Action]
+    settle_mut(var m, view)
+    m.key_line = m.line
+    m.key_col = m.col
+    vimnormal.handle_key(var m, view, code)
+    take_actions(var m)
+
+// step_mut changes a state for a keystroke and answers the actions the host
+// applies.  The state it is given is the new state afterwards, and
+// `key_line` and `key_col` of it hold the cursor the key was typed at.  A
+// key release and a key the package has no use for leave the state as it
+// is and answer no actions.
+pub fn step_mut<V: TextView>(var m: Modal, view: V, key: KeyStroke) -> [Action]
+    step_code_mut(var m, view, vimkey.key_code(key))
 
 // step is the state after a keystroke, and the actions the host applies.
 //
@@ -54,53 +95,80 @@ pub fn settle<V: TextView>(m: Modal, view: V) -> Modal
 // package has no use for answer the same state and no actions.
 pub fn step<V: TextView>(m: Modal, view: V, key: KeyStroke) -> Step
     var n = vimmodal.modal_clone(m)
-    settle_in(var n, view)
-    vimnormal.handle_key(var n, view, vimkey.key_code(key))
-    finish(var n)
+    let acts = step_mut(var n, view, key)
+    Step { modal: n, actions: acts }
 
 // step_code is `step` for a key given as the number the package reads, which
 // `vimkey.codes_of` makes from keys written in text.
 pub fn step_code<V: TextView>(m: Modal, view: V, code: Int) -> Step
     var n = vimmodal.modal_clone(m)
-    settle_in(var n, view)
-    vimnormal.handle_key(var n, view, code)
-    finish(var n)
+    let acts = step_code_mut(var n, view, code)
+    Step { modal: n, actions: acts }
+
+// search_found_mut tells the package where a search ended, and changes the
+// state.  The cursor moves there, or the pending operator works up to there.
+pub fn search_found_mut<V: TextView>(var m: Modal, view: V, line: Int, col: Int) -> [Action]
+    settle_mut(var m, view)
+    vimnormal.search_done(var m, view, true, line, col)
+    take_actions(var m)
 
 // search_found tells the package where a search ended.  The cursor moves
 // there, or the pending operator works up to there.
 pub fn search_found<V: TextView>(m: Modal, view: V, line: Int, col: Int) -> Step
     var n = vimmodal.modal_clone(m)
-    settle_in(var n, view)
-    vimnormal.search_done(var n, view, true, line, col)
-    finish(var n)
+    let acts = search_found_mut(var n, view, line, col)
+    Step { modal: n, actions: acts }
+
+// search_failed_mut tells the package that a search found nothing, and
+// changes the state.
+pub fn search_failed_mut<V: TextView>(var m: Modal, view: V) -> [Action]
+    vimnormal.search_done(var m, view, false, 0, 0)
+    take_actions(var m)
 
 // search_failed tells the package that a search found nothing.
 pub fn search_failed<V: TextView>(m: Modal, view: V) -> Step
     var n = vimmodal.modal_clone(m)
-    vimnormal.search_done(var n, view, false, 0, 0)
-    finish(var n)
+    let acts = search_failed_mut(var n, view)
+    Step { modal: n, actions: acts }
+
+// cmdline_done_mut tells the package that the command line the host read is
+// finished, and changes the state.  The text is the search pattern for `/`
+// and `?` and is not used for `:`, whose command the host runs itself.
+pub fn cmdline_done_mut<V: TextView>(var m: Modal, view: V, text: Str) -> [Action]
+    vimnormal.cmdline_finish(var m, view, text)
+    take_actions(var m)
 
 // cmdline_done tells the package that the command line the host read is
 // finished.  The text is the search pattern for `/` and `?` and is not used
 // for `:`, whose command the host runs itself.
 pub fn cmdline_done<V: TextView>(m: Modal, view: V, text: Str) -> Step
     var n = vimmodal.modal_clone(m)
-    vimnormal.cmdline_finish(var n, view, text)
-    finish(var n)
+    let acts = cmdline_done_mut(var n, view, text)
+    Step { modal: n, actions: acts }
+
+// cmdline_abort_mut tells the package that the command line was left with
+// Escape, and changes the state.
+pub fn cmdline_abort_mut(var m: Modal) -> [Action]
+    vimnormal.cmdline_cancel(var m)
+    take_actions(var m)
 
 // cmdline_abort tells the package that the command line was left with Escape.
 pub fn cmdline_abort(m: Modal) -> Step
     var n = vimmodal.modal_clone(m)
-    vimnormal.cmdline_cancel(var n)
-    finish(var n)
+    let acts = cmdline_abort_mut(var n)
+    Step { modal: n, actions: acts }
+
+// set_cursor_mut moves the cursor to a place the host chose, in place.
+pub fn set_cursor_mut<V: TextView>(var m: Modal, view: V, line: Int, col: Int)
+    m.line = line
+    m.col = col
+    m.want = col
+    m.nonblank = false
+    settle_mut(var m, view)
 
 // set_cursor moves the cursor to a place the host chose, as it does after an
 // undo or a redo.
 pub fn set_cursor<V: TextView>(m: Modal, view: V, line: Int, col: Int) -> Modal
     var n = vimmodal.modal_clone(m)
-    n.line = line
-    n.col = col
-    n.want = col
-    n.nonblank = false
-    settle_in(var n, view)
+    set_cursor_mut(var n, view, line, col)
     n

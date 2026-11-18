@@ -1,0 +1,261 @@
+// step_mut_tests.nv — the entry points that change the state in place, the
+// cursor a key was typed at, and the pending command a host can forget.
+
+use std.test
+use std.list
+use std.str
+use keymodel
+use vimtext
+use vimmodal
+use vimkey
+use vimstep
+use vimram
+
+fn kind(a: Action) -> Str
+    match a
+        MoveCursor(l, c)         => "MoveCursor"
+        Delete(s)                => "Delete"
+        Insert(l, c, t)          => "Insert"
+        ReplaceChar(l, c, n, ch) => "ReplaceChar"
+        JoinLines(l, n, sp)      => "JoinLines"
+        Indent(f, l, n)          => "Indent"
+        Dedent(f, l, n)          => "Dedent"
+        ChangeCase(s, k)         => "ChangeCase"
+        Yank(s)                  => "Yank"
+        Put(l, c, t, lw)         => "Put"
+        Undo                     => "Undo"
+        Redo                     => "Redo"
+        UndoMark(l, c)           => "UndoMark"
+        SetMode(m)               => "SetMode"
+        Search(f, p, w, n)       => "Search"
+        EnterCommandLine(k, i)   => "EnterCommandLine"
+        ScrollBy(n)              => "ScrollBy"
+        ScrollPage(d, n)         => "ScrollPage"
+        Bell                     => "Bell"
+
+fn kinds(acts: [Action]) -> [Str]
+    var out: [Str] = []
+    for a in acts
+        list.push(out, kind(a))
+    out
+
+// the_undo_mark is the place the first `UndoMark` of a list names, or -1 and
+// -1 when there is none.
+fn the_undo_mark(acts: [Action]) -> [Int]
+    for a in acts
+        match a
+            UndoMark(l, c) =>
+                return [l, c]
+            _              =>
+                continue
+    [0 - 1, 0 - 1]
+
+// summary is every field of a state a key can change, as one string, so two
+// states can be compared.
+fn summary(m: Modal) -> Str
+    var s = "${m.mode} ${m.line} ${m.col} ${m.want} ${m.count} ${m.op} ${m.op_count}"
+    s = s + " ${m.reg_count} ${m.prefix} ${m.reg} ${m.unnamed} ${m.find_ch} ${m.find_kind}"
+    s = s + " ${m.search_forward} ${m.search_wait} ${m.dot_count} ${m.dot_reg} ${m.dot_valid}"
+    s = s + " ${m.replaying} ${m.ins_count} ${m.ins_line} ${m.ins_col} ${m.ins_lead}"
+    s = s + " ${m.anchor_line} ${m.anchor_col} ${m.last_visual_mode} ${m.cmdline_kind}"
+    s = s + " ${m.prev_mode} ${m.nonblank} ${m.key_line} ${m.key_col} ${list.len(m.out)}"
+    s = s + " ${m.cmd_keys} ${m.dot_keys} ${m.dot_text} ${m.ins_text} ${m.ins_orig}"
+    s = s + " ${m.marks_line} ${m.marks_col} ${m.regs_linewise} ${m.regs_set}"
+    for r in m.regs
+        s = s + "|" + r
+    s
+
+fn doc_of(text: [Str]) -> Doc
+    vimram.doc_new(text, 5)
+
+fn text_of() -> [Str]
+    ["alpha beta gamma", "  delta (eps) zeta", "", "eta theta", "iota kappa lambda"]
+
+@test
+fn test_a_step_in_place_answers_what_the_plain_step_answers() [io]
+    let d = doc_of(text_of())
+    let scripts = ["dw", "jlx", "3ddp", "ifoo<Esc>j.", "yyjp", "vjd", "wcwxyz<Esc>",
+                   "maj`a", "Vjy", "2dd", "A!<Esc>", ">>", "ggJ", "gUiw", "fa;,", "d}",
+                   "dfZ", "r", "xu", "ixy<C-w>z<Esc>", "R12<Esc>", "ci(", "}{"]
+    for script in scripts
+        test.case(script)
+        var plain = vimmodal.modal_new()
+        var inplace = vimmodal.modal_new()
+        for c in vimkey.codes_of(script)
+            let s = vimstep.step_code(plain, d, c)
+            plain = s.modal
+            let acts = vimstep.step_code_mut(var inplace, d, c)
+            test.assert_eq(kinds(acts), kinds(s.actions))
+            test.assert_eq(summary(inplace), summary(plain))
+
+@test
+fn test_a_step_in_place_changes_the_state_it_is_given() [io]
+    let d = doc_of(["abc def"])
+    var m = vimmodal.modal_new()
+    let acts = vimstep.step_mut(var m, d, keymodel.char_key('x'))
+    test.assert_eq(kinds(acts), ["UndoMark", "Delete"])
+    test.assert_eq(m.reg_text('"'), "a")
+    test.case("the actions do not stay in the state")
+    test.assert_eq(list.len(m.out), 0)
+    test.assert_eq(kinds(vimstep.step_mut(var m, d, keymodel.char_key('l'))), ["MoveCursor"])
+    test.assert_eq(list.len(m.out), 0)
+    test.case("a state kept by name sees the change")
+    let same = m
+    vimstep.step_mut(var m, d, keymodel.char_key('x'))
+    test.assert_eq(same.reg_text('"'), "b")
+    test.case("a copy does not")
+    let kept = vimmodal.modal_clone(m)
+    vimstep.step_mut(var m, d, keymodel.char_key('l'))
+    vimstep.step_mut(var m, d, keymodel.char_key('x'))
+    test.assert_eq(kept.reg_text('"'), "b")
+    test.assert_eq(m.reg_text('"'), "c")
+    test.case("a key that is released changes nothing")
+    let before = summary(m)
+    let up = KeyStroke { press: keymodel.key_char('x'),
+        mods: keymodel.no_mods(),
+        motion: keymodel.KEY_UP_EVENT }
+    test.assert_eq(kinds(vimstep.step_mut(var m, d, up)), [])
+    test.assert_eq(summary(m), before)
+
+@test
+fn test_the_plain_forms_leave_the_state_they_are_given() [io]
+    let d = doc_of(text_of())
+    var m = vimmodal.modal_new()
+    m = vimstep.step_code(m, d, '/').modal
+    let before = summary(m)
+    test.assert_eq(m.mode, vimmodal.MODE_CMDLINE)
+    vimstep.cmdline_done(m, d, "eta")
+    vimstep.cmdline_abort(m)
+    vimstep.step_code(m, d, 'x')
+    test.assert_eq(summary(m), before)
+    let asked = vimstep.cmdline_done(m, d, "eta")
+    let after = summary(asked.modal)
+    vimstep.search_found(asked.modal, d, 3, 0)
+    vimstep.search_failed(asked.modal, d)
+    vimstep.set_cursor(asked.modal, d, 2, 2)
+    vimstep.settle(asked.modal, d)
+    test.assert_eq(summary(asked.modal), after)
+
+@test
+fn test_the_search_and_the_command_line_in_place() [io]
+    let d = doc_of(text_of())
+    var m = vimmodal.modal_new()
+    test.case("a command line")
+    vimstep.step_mut(var m, d, keymodel.char_key(':'))
+    test.assert_eq(m.mode, vimmodal.MODE_CMDLINE)
+    test.assert_eq(kinds(vimstep.cmdline_abort_mut(var m)), ["SetMode"])
+    test.assert_eq(m.mode, vimmodal.MODE_NORMAL)
+    test.case("a search the host answers with a place")
+    vimstep.step_mut(var m, d, keymodel.char_key('/'))
+    let asked = vimstep.cmdline_done_mut(var m, d, "theta")
+    test.assert_eq(kinds(asked), ["SetMode", "Search"])
+    test.assert(m.search_wait)
+    test.assert_eq(kinds(vimstep.search_found_mut(var m, d, 3, 4)), ["MoveCursor"])
+    test.assert_eq(m.line, 3)
+    test.assert_eq(m.col, 4)
+    test.assert(not m.search_wait)
+    test.case("a search that found nothing")
+    vimstep.step_mut(var m, d, keymodel.char_key('/'))
+    vimstep.cmdline_done_mut(var m, d, "zzz")
+    test.assert_eq(kinds(vimstep.search_failed_mut(var m, d)), ["Bell"])
+    test.assert(not m.search_wait)
+    test.case("an answer nobody asked for")
+    test.assert_eq(kinds(vimstep.search_found_mut(var m, d, 1, 1)), [])
+    test.assert_eq(kinds(vimstep.search_failed_mut(var m, d)), [])
+
+@test
+fn test_the_cursor_is_set_and_settled_in_place() [io]
+    let d = doc_of(["abc", "  def", ""])
+    var m = vimmodal.modal_new()
+    vimstep.set_cursor_mut(var m, d, 9, 9)
+    test.assert_eq(m.line, 2)
+    test.assert_eq(m.col, 0)
+    vimstep.set_cursor_mut(var m, d, 1, 99)
+    test.assert_eq(m.line, 1)
+    test.assert_eq(m.col, 4)
+    m.line = 1
+    m.col = 0
+    m.nonblank = true
+    vimstep.settle_mut(var m, d)
+    test.assert_eq(m.col, 2)
+    test.assert(not m.nonblank)
+
+@test
+fn test_a_key_reports_the_cursor_it_was_typed_at() [io]
+    let d = doc_of(text_of())
+    var m = vimmodal.modal_new()
+    test.case("each key in turn")
+    vimstep.step_code_mut(var m, d, 'j')
+    test.assert_eq([m.key_line, m.key_col], [0, 0])
+    test.assert_eq([m.line, m.col], [1, 0])
+    vimstep.step_code_mut(var m, d, 'l')
+    test.assert_eq([m.key_line, m.key_col], [1, 0])
+    vimstep.step_code_mut(var m, d, 'x')
+    test.assert_eq([m.key_line, m.key_col], [1, 1])
+    test.case("the cursor of an UndoMark is the cursor of the key")
+    m.line = 3
+    m.col = 5
+    let acts = vimstep.step_code_mut(var m, d, 'x')
+    test.assert_eq(the_undo_mark(acts), [3, 5])
+    test.assert_eq([m.key_line, m.key_col], [3, 5])
+    test.case("a cursor outside the text is brought inside first")
+    m.line = 99
+    m.col = 99
+    vimstep.step_code_mut(var m, d, 'l')
+    test.assert_eq([m.key_line, m.key_col], [4, 16])
+    test.case("the plain step reports it in its new state")
+    let s = vimstep.step_code(m, d, 'k')
+    test.assert_eq([s.modal.key_line, s.modal.key_col], [4, 16])
+    test.assert_eq([s.modal.line, s.modal.col], [3, 8])
+    test.case("a new state starts at the origin")
+    let fresh = vimmodal.modal_new()
+    test.assert_eq([fresh.key_line, fresh.key_col], [0, 0])
+
+// The text in memory keeps the cursor of each `u` and `Ctrl-R` key from
+// `Modal.key_line` and `Modal.key_col`, and puts the cursor back there when
+// the change it redoes is on that line.
+@test
+fn test_a_redo_puts_the_cursor_back_from_the_cursor_of_the_key() [io]
+    var d = doc_of(["one two", "three four", "five"])
+    var m = vimmodal.modal_new()
+    m = vimram.run(var d, m, "jwdw")
+    test.assert_eq(vimram.doc_lines(d), ["one two", "three ", "five"])
+    test.assert_eq([m.line, m.col], [1, 5])
+    test.case("the undo goes back to where the change was made from")
+    m = vimram.run(var d, m, "u")
+    test.assert_eq([m.line, m.col], [1, 6])
+    test.assert_eq([m.key_line, m.key_col], [1, 5])
+    test.assert_eq(vimram.doc_lines(d), ["one two", "three four", "five"])
+    test.case("the redo goes back to where the undo key was typed")
+    m = vimram.run(var d, m, "<C-r>")
+    test.assert_eq(vimram.doc_lines(d), ["one two", "three ", "five"])
+    test.assert_eq([m.line, m.col], [1, 5])
+    test.case("a redo from another line goes to the first non-blank character")
+    m = vimram.run(var d, m, "ggu")
+    m = vimram.run(var d, m, "G<C-r>")
+    test.assert_eq([m.line, m.col], [1, 0])
+
+@test
+fn test_a_pending_command_is_forgotten_without_a_key() [io]
+    let d = doc_of(text_of())
+    var m = vimmodal.modal_new()
+    vimstep.step_code_mut(var m, d, '2')
+    vimstep.step_code_mut(var m, d, '"')
+    vimstep.step_code_mut(var m, d, 'a')
+    vimstep.step_code_mut(var m, d, 'd')
+    test.assert_eq(m.mode_of(), vimmodal.MODE_OP_PENDING)
+    test.assert(m.op != vimmodal.OP_NONE)
+    m.reset_pending()
+    test.assert_eq(m.mode_of(), vimmodal.MODE_NORMAL)
+    test.assert_eq(m.op, vimmodal.OP_NONE)
+    test.assert_eq(m.count, 0)
+    test.assert_eq(m.reg, 0)
+    test.case("the next key is a command of its own")
+    let acts = vimstep.step_code_mut(var m, d, 'w')
+    test.assert_eq(kinds(acts), ["MoveCursor"])
+    test.assert_eq([m.line, m.col], [0, 6])
+    test.case("a prefix key is forgotten as well")
+    vimstep.step_code_mut(var m, d, 'g')
+    test.assert(m.prefix != 0)
+    m.reset_pending()
+    test.assert_eq(m.prefix, 0)

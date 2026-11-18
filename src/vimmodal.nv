@@ -5,7 +5,8 @@
 // text: the mode, the cursor, the count and the operator being typed, the
 // registers, the marks, the last find and search, the record the dot
 // command repeats, and the insert being typed.  A step takes a `Modal`
-// and answers a new one; the one it was given is not changed.
+// and answers a new one, or changes the one it is given when the host
+// calls the `_mut` form of the entry point.
 //
 // The text belongs to the host.  A step answers a list of `Action`
 // values, and the host applies them to its text in the order given.  The
@@ -195,6 +196,12 @@ pub struct Step
 // pending-command display, and the Visual anchor for drawing a selection.
 // A host changes none of them directly.  It tells the package about the
 // world through `vimstep` instead.
+//
+// `key_line` and `key_col` are the cursor the last key was typed at, after
+// it was brought inside the text, which is the cursor an `UndoMark` of that
+// key names.  A step that changes the state in place leaves the host no old
+// state to read it from, and a redo needs it: the cursor to put back is
+// where the key `u` was typed.
 pub struct Modal
     var mode: Int
     var line: Int
@@ -235,6 +242,8 @@ pub struct Modal
     var cmdline_kind: Int
     var prev_mode: Int
     var nonblank: Bool
+    var key_line: Int
+    var key_col: Int
     var out: [Action]
 
 // modal_new is the state of an editor that has just started: Normal mode,
@@ -264,7 +273,8 @@ pub fn modal_new() -> Modal
             dot_valid: false, replaying: false, ins_text: [], ins_count: 1,
             ins_line: 0, ins_col: 0, ins_orig: [], ins_lead: 0, anchor_line: 0,
             anchor_col: 0, last_visual_mode: MODE_VISUAL, cmdline_kind: 0,
-            prev_mode: MODE_NORMAL, nonblank: false, out: [] }
+            prev_mode: MODE_NORMAL, nonblank: false, key_line: 0, key_col: 0,
+            out: [] }
 
 // modal_clone is a copy of a state that shares nothing with it.
 pub fn modal_clone(m: Modal) -> Modal
@@ -287,7 +297,8 @@ pub fn modal_clone(m: Modal) -> Modal
             anchor_line: m.anchor_line,
             anchor_col: m.anchor_col, last_visual_mode: m.last_visual_mode,
             cmdline_kind: m.cmdline_kind, prev_mode: m.prev_mode,
-            nonblank: m.nonblank, out: [] }
+            nonblank: m.nonblank, key_line: m.key_line, key_col: m.key_col,
+            out: [] }
 
 // is_visual says whether a mode is one of the Visual modes.
 pub fn is_visual(mode: Int) -> Bool
@@ -405,7 +416,11 @@ impl Modal
         self.emit(UndoMark(line: self.line, col: self.col))
 
     // reset_pending forgets the count, the operator, the prefix key, the
-    // register choice and the keys of the command being typed.
+    // register choice and the keys of the command being typed.  A host
+    // calls it to end a command itself, with no key: when its own key map
+    // takes the next key, or when a timeout abandons a prefix such as the
+    // `g` of `gg`.  The mode, the cursor, the registers and the dot record
+    // stay.
     fn reset_pending(var self)
         self.count = 0
         self.op_count = 0

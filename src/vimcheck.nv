@@ -1,0 +1,23 @@
+// vimcheck.nv — names every module of the package that a program may use,
+// so that building the package as a library checks all of them.
+//
+// A library has no `main`, and the compiler leaves out a module that every
+// `use` naming it has removed (SPEC section 9.6, the dead-module rule).
+// `vimstep` holds a `use vimram` behind a false condition, and `vimstep` is
+// named by `vimram` alone, so with nothing else naming it the whole package
+// would be left out and `novo pkg build` would check none of it.  A module
+// that no `use` names stays, so this one stays, and its `use` lines keep the
+// modules below it.  It holds no code and a program that names none of them
+// gets no code from it.  `vimram` is not named here on purpose: it is the
+// module that a program must ask for, and the test suites do.
+
+use vimtext
+use vimmodal
+use vimkey
+use vimmotion
+use vimobject
+use vimscroll
+use vimedit
+use viminsert
+use vimnormal
+use vimstep

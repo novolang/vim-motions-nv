@@ -508,18 +508,18 @@ fn has_bell(acts: [Action]) -> Bool
 // that is refused discards the keys after it, as an editor discards what
 // was typed ahead after an error.
 pub fn run(var d: Doc, m0: Modal, keys: Str) -> Modal
-    var m = m0
+    // The state given is not changed: the steps work on a copy.
+    var m = vimmodal.modal_clone(m0)
     var rest = vimkey.codes_of(keys)
     while list.len(rest) > 0
-        d.hint_line = m.line
-        d.hint_col = m.col
-        let s = vimstep.step_code(m, d, rest[0])
+        let acts = vimstep.step_code_mut(var m, d, rest[0])
+        d.hint_line = m.key_line
+        d.hint_col = m.key_col
         rest = rest[1:]
-        m = s.modal
-        m = apply_actions(var d, m, s.actions)
-        if has_bell(s.actions)
+        m = apply_actions(var d, m, acts)
+        if has_bell(acts)
             rest = []
-        let kind = cmdline_kind_of(s.actions)
+        let kind = cmdline_kind_of(acts)
         if kind >= 0
             var text: [Int] = []
             var aborted = false
@@ -540,5 +540,5 @@ pub fn run(var d: Doc, m0: Modal, keys: Str) -> Modal
                 let done = vimstep.cmdline_done(m, d, vimtext.encode_utf8(text))
                 m = done.modal
                 m = apply_actions(var d, m, done.actions)
-        m = vimstep.settle(m, d)
+        vimstep.settle_mut(var m, d)
     m
